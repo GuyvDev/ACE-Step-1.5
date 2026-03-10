@@ -265,3 +265,5 @@ training_runs/billy_joel_v2/train_tensors/
 !training_runs/billy_joel_v2/lora_output_20260308/**
 !training_runs/billy_joel_v2/lora_runA/
 !training_runs/billy_joel_v2/lora_runA/**
+training_runs/billy_joel_v2/lora_output_20260308/**/training_state.pt
+training_runs/billy_joel_v2/lora_runA/**/training_state.pt
