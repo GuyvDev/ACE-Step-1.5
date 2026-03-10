@@ -255,3 +255,13 @@ docs/.vitepress/dist/
 docs/.vitepress/cache/
 docs/en/awesome.md
 package-lock.json
+
+# Keep Billy Joel LoRA backups, ignore preprocessing cache
+training_runs/**
+!training_runs/
+!training_runs/billy_joel_v2/
+training_runs/billy_joel_v2/train_tensors/
+!training_runs/billy_joel_v2/lora_output_20260308/
+!training_runs/billy_joel_v2/lora_output_20260308/**
+!training_runs/billy_joel_v2/lora_runA/
+!training_runs/billy_joel_v2/lora_runA/**

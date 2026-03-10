@@ -15,6 +15,7 @@ Input modes:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -37,6 +38,17 @@ from acestep.training_v2.preprocess_vae import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _build_sample_id(audio_file: Path, sample_meta: Dict[str, Any]) -> str:
+    """Build a stable, collision-free tensor filename stem for a sample."""
+    meta_name = str(sample_meta.get("filename", "")).strip()
+    if meta_name:
+        base = Path(meta_name).stem
+    else:
+        base = f"{audio_file.parent.name}_{audio_file.stem}"
+    digest = hashlib.sha1(str(audio_file.resolve()).encode("utf-8")).hexdigest()[:10]
+    return f"{base}_{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +245,12 @@ def _pass1_light(
             if progress_callback:
                 progress_callback(i, total, f"[Pass 1] {af.name}")
 
+            path_key = str(af.resolve())
+            sm = sample_meta.get(path_key) or sample_meta.get(af.name, {})
+            sample_id = _build_sample_id(af, sm)
+
             # Skip if final .pt already exists (resumable)
-            final_pt = out_path / f"{af.stem}.pt"
+            final_pt = out_path / f"{sample_id}.pt"
             if final_pt.exists():
                 logger.info("[Side-Step] Skipping (final exists): %s", af.name)
                 continue
@@ -257,7 +273,6 @@ def _pass1_light(
                 )
 
                 # 3. Text encode
-                sm = sample_meta.get(af.name, {})
                 caption = sm.get("caption", af.stem)
                 lyrics = sm.get("lyrics", "[Instrumental]")
 
@@ -276,7 +291,7 @@ def _pass1_light(
                     )
 
                 # 4. Save intermediate
-                tmp_path = out_path / f"{af.stem}.tmp.pt"
+                tmp_path = out_path / f"{sample_id}.tmp.pt"
                 torch.save(
                     {
                         "target_latents": target_latents.squeeze(0).cpu(),
@@ -288,8 +303,9 @@ def _pass1_light(
                         "silence_latent": silence_latent.cpu(),
                         "latent_length": latent_length,
                         "metadata": {
+                            "sample_id": sample_id,
                             "audio_path": str(af),
-                            "filename": af.name,
+                            "filename": sm.get("filename", af.name),
                             "caption": caption,
                             "lyrics": lyrics,
                             "duration": sm.get("duration", 0),

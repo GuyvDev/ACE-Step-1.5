@@ -106,7 +106,19 @@ def load_sample_metadata(
         try:
             raw = json.loads(Path(dataset_json).read_text(encoding="utf-8"))
             samples = raw if isinstance(raw, list) else raw.get("samples", [])
+            json_dir = Path(dataset_json).parent
             for s in samples:
+                # Primary key: resolved audio_path (unique and collision-free)
+                audio_path = s.get("audio_path", "")
+                if audio_path:
+                    p = Path(audio_path)
+                    if not p.is_absolute():
+                        p = json_dir / p
+                    try:
+                        meta[str(p.resolve())] = s
+                    except OSError:
+                        meta[str(p)] = s
+
                 # Primary key: explicit filename field
                 fname = s.get("filename", "")
                 if fname:
@@ -126,8 +138,9 @@ def load_sample_metadata(
 
     # Fill defaults for any audio file without metadata
     for af in audio_files:
-        if af.name not in meta:
-            meta[af.name] = {
+        path_key = str(af.resolve())
+        if path_key not in meta and af.name not in meta:
+            default = {
                 "filename": af.name,
                 "caption": af.stem.replace("_", " ").replace("-", " "),
                 "lyrics": "[Instrumental]",
@@ -138,6 +151,8 @@ def load_sample_metadata(
                 "duration": 0,
                 "is_instrumental": True,
             }
+            meta[path_key] = default
+            meta[af.name] = default
 
     return meta
 
