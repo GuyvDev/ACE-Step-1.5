@@ -45,12 +45,15 @@ class PreprocessedTensorDataset(Dataset):
     No VAE/text encoder needed during training - just load tensors directly!
     """
     
-    def __init__(self, tensor_dir: str):
+    def __init__(self, tensor_dir: str, timing_dir: Optional[str] = None):
         """Initialize from a directory of preprocessed .pt files.
-        
+
         Args:
             tensor_dir: Directory containing preprocessed .pt files and manifest.json
-            
+            timing_dir: Optional directory containing .timing.pt sidecar files produced
+                        by extract_timing_features.py (Phase D). When provided, timing
+                        features are loaded and returned in each sample dict.
+
         Raises:
             ValueError: If tensor_dir is not an existing directory or escapes safe root.
         """
@@ -58,6 +61,8 @@ class PreprocessedTensorDataset(Dataset):
         if not os.path.isdir(validated_dir):
             raise ValueError(f"Not an existing directory: {tensor_dir}")
         self.tensor_dir = validated_dir
+        # Phase D: optional timing sidecar directory
+        self.timing_dir: Optional[str] = timing_dir
         self.sample_paths: List[str] = []
         
         # Load manifest if exists
@@ -139,14 +144,62 @@ class PreprocessedTensorDataset(Dataset):
         tensor_path = self.valid_paths[idx]
         data = torch.load(tensor_path, map_location='cpu', weights_only=True)
         
-        return {
+        sample = {
             "target_latents": data["target_latents"],  # [T, 64]
             "attention_mask": data["attention_mask"],  # [T]
             "encoder_hidden_states": data["encoder_hidden_states"],  # [L, D]
             "encoder_attention_mask": data["encoder_attention_mask"],  # [L]
             "context_latents": data["context_latents"],  # [T, 65]
             "metadata": data.get("metadata", {}),
+            "ref_voice_features": data.get("ref_voice_features"),
+            "ref_voice_attention_mask": data.get("ref_voice_attention_mask"),
+            "text_hidden_states": data.get("text_hidden_states"),
+            "text_attention_mask": data.get("text_attention_mask"),
+            "lyric_hidden_states": data.get("lyric_hidden_states"),
+            "lyric_attention_mask": data.get("lyric_attention_mask"),
+            # Phase D: timing features (None if not available)
+            "timing_tokens": None,
+            "timing_targets": None,
+            "timing_mask": None,
+            "phrase_features": None,
+            "global_phrase_features": None,
+            "phrase_ids": None,
+            "timing_event_starts": None,
+            "timing_event_ends": None,
+            "timing_audio_duration": None,
+            "timing_metadata": None,
         }
+
+        # Phase D: load timing sidecar if timing_dir is configured
+        if self.timing_dir is not None:
+            # Derive sidecar filename from tensor filename
+            tensor_basename = os.path.splitext(os.path.basename(tensor_path))[0]
+            # Strip hash suffix (_xxxxxxxx) if present (8 hex chars after last _)
+            # e.g. 001_piano_man_s003_c40820d4be -> 001_piano_man_s003
+            base_stem = tensor_basename
+            parts = tensor_basename.rsplit("_", 1)
+            if len(parts) == 2 and len(parts[1]) >= 8 and all(c in "0123456789abcdef" for c in parts[1]):
+                base_stem = parts[0]
+            timing_path = os.path.join(self.timing_dir, f"{base_stem}.timing.pt")
+            if os.path.exists(timing_path):
+                try:
+                    tdata = torch.load(timing_path, map_location="cpu", weights_only=False)
+                    sample["timing_tokens"] = tdata.get("timing_tokens")
+                    sample["timing_targets"] = tdata.get("timing_targets")
+                    sample["timing_mask"] = tdata.get("timing_mask")
+                    sample["phrase_features"] = tdata.get("phrase_features")
+                    sample["global_phrase_features"] = tdata.get("global_phrase_features")
+                    sample["phrase_ids"] = tdata.get("phrase_ids")
+                    sample["timing_event_starts"] = tdata.get("event_start_sec")
+                    sample["timing_event_ends"] = tdata.get("event_end_sec")
+                    sample["timing_audio_duration"] = tdata.get("audio_duration_sec")
+                    sample["timing_metadata"] = tdata.get("timing_metadata")
+                except Exception as e:
+                    logger.warning(
+                        "Failed to load timing sidecar %s: %s", timing_path, e
+                    )
+
+        return sample
 
 
 def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -170,7 +223,50 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     encoder_hidden_states = []
     encoder_attention_masks = []
     context_latents = []
-    
+    any_ref_voice = any(
+        sample.get("ref_voice_features") is not None and sample.get("ref_voice_attention_mask") is not None
+        for sample in batch
+    )
+    keep_text_lyric_inputs = any_ref_voice and all(
+        sample.get("text_hidden_states") is not None
+        and sample.get("text_attention_mask") is not None
+        and sample.get("lyric_hidden_states") is not None
+        and sample.get("lyric_attention_mask") is not None
+        for sample in batch
+    )
+    ref_voice_features = []
+    ref_voice_attention_masks = []
+    text_hidden_states_keep = []
+    text_attention_masks_keep = []
+    lyric_hidden_states_keep = []
+    lyric_attention_masks_keep = []
+    max_ref_len = 0
+    ref_rank = None
+    ref_layers = None
+    ref_dim = None
+    max_text_len_keep = 0
+    max_lyric_len_keep = 0
+
+    if any_ref_voice:
+        for sample in batch:
+            rvf = sample.get("ref_voice_features")
+            if rvf is None:
+                continue
+            if rvf.ndim == 3:
+                ref_rank = 3
+                ref_layers = rvf.shape[0]
+                max_ref_len = max(max_ref_len, rvf.shape[1])
+                ref_dim = rvf.shape[2]
+            elif rvf.ndim == 2:
+                ref_rank = 2
+                max_ref_len = max(max_ref_len, rvf.shape[0])
+                ref_dim = rvf.shape[1]
+            else:
+                raise ValueError(f"Unsupported ref_voice_features shape: {tuple(rvf.shape)}")
+        if keep_text_lyric_inputs:
+            max_text_len_keep = max(sample["text_hidden_states"].shape[0] for sample in batch)
+            max_lyric_len_keep = max(sample["lyric_hidden_states"].shape[0] for sample in batch)
+
     for sample in batch:
         # Pad target_latents [T, 64] -> [max_T, 64]
         tl = sample["target_latents"]
@@ -206,8 +302,57 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
             pad = eam.new_zeros(max_encoder_len - eam.shape[0])
             eam = torch.cat([eam, pad], dim=0)
         encoder_attention_masks.append(eam)
-    
-    return {
+
+        if any_ref_voice:
+            rvf = sample.get("ref_voice_features")
+            rvm = sample.get("ref_voice_attention_mask")
+            if rvf is None or rvm is None:
+                if ref_rank == 3:
+                    rvf = torch.zeros(ref_layers, max_ref_len, ref_dim, dtype=ehs.dtype)
+                else:
+                    rvf = torch.zeros(max_ref_len, ref_dim, dtype=ehs.dtype)
+                rvm = torch.zeros(max_ref_len, dtype=eam.dtype)
+            else:
+                if ref_rank == 3:
+                    if rvf.shape[1] < max_ref_len:
+                        pad = rvf.new_zeros(rvf.shape[0], max_ref_len - rvf.shape[1], rvf.shape[2])
+                        rvf = torch.cat([rvf, pad], dim=1)
+                else:
+                    if rvf.shape[0] < max_ref_len:
+                        pad = rvf.new_zeros(max_ref_len - rvf.shape[0], rvf.shape[1])
+                        rvf = torch.cat([rvf, pad], dim=0)
+                if rvm.shape[0] < max_ref_len:
+                    pad = rvm.new_zeros(max_ref_len - rvm.shape[0])
+                    rvm = torch.cat([rvm, pad], dim=0)
+            ref_voice_features.append(rvf)
+            ref_voice_attention_masks.append(rvm)
+
+            if keep_text_lyric_inputs:
+                ths = sample["text_hidden_states"]
+                tam = sample["text_attention_mask"]
+                lhs = sample["lyric_hidden_states"]
+                lam = sample["lyric_attention_mask"]
+
+                if ths.shape[0] < max_text_len_keep:
+                    pad = ths.new_zeros(max_text_len_keep - ths.shape[0], ths.shape[1])
+                    ths = torch.cat([ths, pad], dim=0)
+                if tam.shape[0] < max_text_len_keep:
+                    pad = tam.new_zeros(max_text_len_keep - tam.shape[0])
+                    tam = torch.cat([tam, pad], dim=0)
+
+                if lhs.shape[0] < max_lyric_len_keep:
+                    pad = lhs.new_zeros(max_lyric_len_keep - lhs.shape[0], lhs.shape[1])
+                    lhs = torch.cat([lhs, pad], dim=0)
+                if lam.shape[0] < max_lyric_len_keep:
+                    pad = lam.new_zeros(max_lyric_len_keep - lam.shape[0])
+                    lam = torch.cat([lam, pad], dim=0)
+
+                text_hidden_states_keep.append(ths)
+                text_attention_masks_keep.append(tam)
+                lyric_hidden_states_keep.append(lhs)
+                lyric_attention_masks_keep.append(lam)
+
+    output = {
         "target_latents": torch.stack(target_latents),  # [B, T, 64]
         "attention_mask": torch.stack(attention_masks),  # [B, T]
         "encoder_hidden_states": torch.stack(encoder_hidden_states),  # [B, L, D]
@@ -215,6 +360,121 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "context_latents": torch.stack(context_latents),  # [B, T, 65]
         "metadata": [s["metadata"] for s in batch],
     }
+    if any_ref_voice:
+        output["ref_voice_features"] = torch.stack(ref_voice_features)
+        output["ref_voice_attention_mask"] = torch.stack(ref_voice_attention_masks)
+        if keep_text_lyric_inputs:
+            output["text_hidden_states"] = torch.stack(text_hidden_states_keep)
+            output["text_attention_mask"] = torch.stack(text_attention_masks_keep)
+            output["lyric_hidden_states"] = torch.stack(lyric_hidden_states_keep)
+            output["lyric_attention_mask"] = torch.stack(lyric_attention_masks_keep)
+
+    # Phase D: collate timing features (pad to longest word sequence in batch)
+    any_timing = any(s.get("timing_tokens") is not None for s in batch)
+    if any_timing:
+        first_timing = next(s["timing_tokens"] for s in batch if s.get("timing_tokens") is not None)
+        first_targets = next(
+            (
+                s.get("timing_targets")
+                for s in batch
+                if s.get("timing_targets") is not None
+            ),
+            None,
+        )
+        max_words = max(
+            s["timing_tokens"].shape[0]
+            for s in batch
+            if s.get("timing_tokens") is not None
+        )
+        n_features = int(first_timing.shape[1])
+        n_targets = int(first_targets.shape[1]) if first_targets is not None else 0
+        first_phrase = next(
+            (s.get("phrase_features") for s in batch if s.get("phrase_features") is not None),
+            None,
+        )
+        first_global_phrase = next(
+            (s.get("global_phrase_features") for s in batch if s.get("global_phrase_features") is not None),
+            None,
+        )
+        phrase_feature_dim = int(first_phrase.shape[1]) if first_phrase is not None else 0
+        global_phrase_dim = int(first_global_phrase.shape[0]) if first_global_phrase is not None else 0
+        tok_batch, tgt_batch, mask_batch = [], [], []
+        phrase_batch, global_phrase_batch, phrase_id_batch = [], [], []
+        event_start_batch, event_end_batch, audio_durations = [], [], []
+        for s in batch:
+            tt = s.get("timing_tokens")
+            if tt is None:
+                # Sample has no timing data: pad with zeros
+                tok_batch.append(torch.zeros(max_words, n_features, dtype=torch.long))
+                if n_targets > 0:
+                    tgt_batch.append(torch.zeros(max_words, n_targets, dtype=torch.float32))
+                mask_batch.append(torch.zeros(max_words, dtype=torch.bool))
+                if phrase_feature_dim > 0:
+                    phrase_batch.append(torch.zeros(max_words, phrase_feature_dim, dtype=torch.float32))
+                    phrase_id_batch.append(torch.zeros(max_words, dtype=torch.long))
+                if global_phrase_dim > 0:
+                    global_phrase_batch.append(torch.zeros(global_phrase_dim, dtype=torch.float32))
+                event_start_batch.append(torch.zeros(max_words, dtype=torch.float32))
+                event_end_batch.append(torch.zeros(max_words, dtype=torch.float32))
+                audio_durations.append(torch.tensor(0.0, dtype=torch.float32))
+            else:
+                N = tt.shape[0]
+                pad = max_words - N
+                tok_batch.append(torch.cat([tt, torch.zeros(pad, n_features, dtype=torch.long)], dim=0))
+                if n_targets > 0:
+                    tm = s.get("timing_targets")
+                    if tm is None:
+                        tm = torch.zeros(N, n_targets, dtype=torch.float32)
+                    tgt_batch.append(torch.cat([tm, torch.zeros(pad, n_targets, dtype=tm.dtype)], dim=0))
+                msk = s.get("timing_mask", torch.ones(N, dtype=torch.bool))
+                mask_batch.append(torch.cat([msk, torch.zeros(pad, dtype=torch.bool)], dim=0))
+                if phrase_feature_dim > 0:
+                    pf = s.get("phrase_features")
+                    if pf is None:
+                        pf = torch.zeros(N, phrase_feature_dim, dtype=torch.float32)
+                    phrase_batch.append(torch.cat([pf, torch.zeros(pad, phrase_feature_dim, dtype=pf.dtype)], dim=0))
+                    phrase_ids = s.get("phrase_ids")
+                    if phrase_ids is None:
+                        phrase_ids = torch.zeros(N, dtype=torch.long)
+                    phrase_id_batch.append(torch.cat([phrase_ids, torch.zeros(pad, dtype=phrase_ids.dtype)], dim=0))
+                if global_phrase_dim > 0:
+                    gpf = s.get("global_phrase_features")
+                    if gpf is None:
+                        gpf = torch.zeros(global_phrase_dim, dtype=torch.float32)
+                    global_phrase_batch.append(gpf.to(torch.float32))
+                ev_start = s.get("timing_event_starts")
+                if ev_start is None:
+                    ev_start = torch.zeros(N, dtype=torch.float32)
+                ev_end = s.get("timing_event_ends")
+                if ev_end is None:
+                    ev_end = torch.zeros(N, dtype=torch.float32)
+                event_start_batch.append(
+                    torch.cat([ev_start, torch.zeros(pad, dtype=ev_start.dtype)], dim=0)
+                )
+                event_end_batch.append(
+                    torch.cat([ev_end, torch.zeros(pad, dtype=ev_end.dtype)], dim=0)
+                )
+                audio_dur = s.get("timing_audio_duration")
+                if audio_dur is None:
+                    audio_dur = torch.tensor(0.0, dtype=torch.float32)
+                elif not isinstance(audio_dur, torch.Tensor):
+                    audio_dur = torch.tensor(float(audio_dur), dtype=torch.float32)
+                audio_durations.append(audio_dur.reshape(()).to(torch.float32))
+        output["timing_tokens"] = torch.stack(tok_batch)     # [B, N_words, 4]
+        if n_targets > 0:
+            output["timing_targets"] = torch.stack(tgt_batch)
+        output["timing_mask"] = torch.stack(mask_batch)      # [B, N_words]
+        if phrase_feature_dim > 0:
+            output["phrase_features"] = torch.stack(phrase_batch)
+            output["phrase_ids"] = torch.stack(phrase_id_batch)
+        if global_phrase_dim > 0:
+            output["global_phrase_features"] = torch.stack(global_phrase_batch)
+        output["timing_event_starts"] = torch.stack(event_start_batch)
+        output["timing_event_ends"] = torch.stack(event_end_batch)
+        output["timing_audio_duration"] = torch.stack(audio_durations)
+        output["timing_metadata"] = [s.get("timing_metadata") for s in batch]
+
+    return output
 
 
 class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else object):
@@ -234,13 +494,15 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         persistent_workers: bool = True,
         pin_memory_device: str = "",
         val_split: float = 0.0,
+        timing_dir: Optional[str] = None,
     ):
         """Initialize the data module.
-        
+
         Args:
             tensor_dir: Directory containing preprocessed .pt files
             batch_size: Training batch size
             num_workers: Number of data loading workers
+            timing_dir: Optional directory with .timing.pt sidecars (Phase D)
             pin_memory: Whether to pin memory for faster GPU transfer
             val_split: Fraction of data for validation (0 = no validation)
         """
@@ -255,15 +517,16 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         self.persistent_workers = persistent_workers
         self.pin_memory_device = pin_memory_device
         self.val_split = val_split
-        
+        self.timing_dir = timing_dir  # Phase D
+
         self.train_dataset = None
         self.val_dataset = None
-    
+
     def setup(self, stage: Optional[str] = None):
         """Setup datasets."""
         if stage == 'fit' or stage is None:
-            # Create full dataset
-            full_dataset = PreprocessedTensorDataset(self.tensor_dir)
+            # Create full dataset (Phase D: pass timing_dir)
+            full_dataset = PreprocessedTensorDataset(self.tensor_dir, timing_dir=self.timing_dir)
             
             # Split if validation requested
             if self.val_split > 0 and len(full_dataset) > 1:

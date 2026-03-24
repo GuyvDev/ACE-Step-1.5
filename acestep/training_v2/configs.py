@@ -142,6 +142,36 @@ class TrainingConfigV2(TrainingConfig):
     cfg_ratio: float = 0.15
     """Classifier-free guidance dropout probability."""
 
+    f0_loss_weight: float = 0.0
+    """Weight for auxiliary F0-contour consistency loss (0 disables)."""
+
+    speaker_loss_weight: float = 0.0
+    """Weight for auxiliary speaker-consistency loss (0 disables)."""
+
+    use_mert_conditioning: bool = False
+    """Enable optional precomputed MERT reference-voice conditioning."""
+
+    mert_model_name_or_path: str = "m-a-p/MERT-v1-330M"
+    """Model name or local path used during preprocessing to extract MERT features."""
+
+    mert_local_files_only: bool = True
+    """Require MERT assets to exist locally instead of downloading at runtime."""
+
+    mert_hidden_size: int = 1024
+    """Hidden size of the precomputed MERT features."""
+
+    mert_num_layers: int = 25
+    """Expected number of MERT hidden-state layers in precomputed features."""
+
+    voice_condition_dropout: float = 0.1
+    """Dropout applied after projecting reference voice states."""
+
+    voice_condition_scale: float = 1.0
+    """Scale applied to projected voice states before concatenation."""
+
+    max_ref_voice_duration: float = 3.0
+    """Maximum duration for reference-voice clips during preprocessing."""
+
     timestep_mu: float = -0.4
     """Mean for logit-normal timestep sampling (from model config)."""
 
@@ -225,6 +255,91 @@ class TrainingConfigV2(TrainingConfig):
     max_duration: float = 240.0
     """Maximum audio duration in seconds (preprocessing)."""
 
+    # --- Phase D: Timing / prosody branch -----------------------------------
+    enable_timing_branch: bool = False
+    """Enable the beat-aware word-aligned timing conditioning branch (Phase D)."""
+
+    timing_dir: Optional[str] = None
+    """Directory containing .timing.pt sidecar files produced by extract_timing_features.py.
+    If None but enable_timing_branch=True, the branch is silently skipped for samples
+    without timing sidecars."""
+
+    timing_hidden_size: int = 256
+    """Internal hidden size of the TimingEncoder transformer."""
+
+    timing_num_heads: int = 4
+    """Number of attention heads in the TimingEncoder."""
+
+    timing_num_layers: int = 2
+    """Number of transformer layers in the TimingEncoder."""
+
+    timing_output_dim: int = 0
+    """Projection dimension from TimingEncoder to DiT conditioning space.
+    0 = auto (uses model hidden_size)."""
+
+    timing_dropout: float = 0.1
+    """Dropout inside TimingEncoder."""
+
+    timing_loss_weight: float = 1.0
+    """Global weight applied to the auxiliary timing supervision loss."""
+
+    timing_dur_weight: float = 1.0
+    """Weight for the duration prediction sub-loss."""
+
+    timing_onset_weight: float = 0.5
+    """Weight for the onset-deviation prediction sub-loss."""
+
+    timing_pause_weight: float = 0.5
+    """Weight for the pause prediction sub-loss."""
+
+    timing_phrase_weight: float = 0.3
+    """Weight for phrase-boundary / phrase-break supervision."""
+
+    timing_tempo_weight: float = 0.2
+    """Weight for local tempo / rubato supervision."""
+
+    timing_terminal_weight: float = 0.2
+    """Weight for phrase-final terminal shaping supervision."""
+
+    timing_condition_dropout: float = 0.1
+    """Probability of dropping timing conditioning during training (for robustness)."""
+
+    timing_condition_scale: float = 1.0
+    """Global scale applied to the projected timing stream before decoder timing attention."""
+
+    timing_use_stream_type_embedding: bool = True
+    """Add a learned stream-type embedding to mark timing states inside the decoder context."""
+
+    timing_decoder_loss_weight: float = 1.0
+    """Weight for decoder-coupled timing supervision on pooled output trajectories."""
+
+    enable_timing_consumer_training: bool = True
+    """Allow the decoder timing consumer weights, norms, and gates to train (Phase E0)."""
+
+    enable_phrase_modulation: bool = False
+    """Enable phrase/global timing-state modulation on top of event timing cross-attention (Phase E1)."""
+
+    timing_global_condition_scale: float = 1.0
+    """Scale applied to the phrase/global timing modulation vector before decoder use."""
+
+    timing_global_bottleneck_dim: int = 8
+    """Bottleneck width for phrase/global decoder modulation (smaller is safer on tiny datasets)."""
+
+    timing_train_last_n_layers: int = 0
+    """Train timing-consumer parameters only in the last N decoder layers (0 = all timing layers)."""
+
+    validate_every_n_epochs: int = 1
+    """Run validation every N epochs when val_split > 0."""
+
+    early_stopping_patience: int = 0
+    """Stop after this many non-improving validation windows (0 disables early stopping)."""
+
+    early_stopping_min_delta: float = 0.0
+    """Minimum validation-loss improvement required to reset early stopping patience."""
+
+    save_best_checkpoint: bool = True
+    """Save a rolling best checkpoint when validation improves."""
+
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
@@ -253,6 +368,14 @@ class TrainingConfigV2(TrainingConfig):
                 "vram_profile": self.vram_profile,
                 "adapter_type": self.adapter_type,
                 "cfg_ratio": self.cfg_ratio,
+                "use_mert_conditioning": self.use_mert_conditioning,
+                "mert_model_name_or_path": self.mert_model_name_or_path,
+                "mert_local_files_only": self.mert_local_files_only,
+                "mert_hidden_size": self.mert_hidden_size,
+                "mert_num_layers": self.mert_num_layers,
+                "voice_condition_dropout": self.voice_condition_dropout,
+                "voice_condition_scale": self.voice_condition_scale,
+                "max_ref_voice_duration": self.max_ref_voice_duration,
                 "timestep_mu": self.timestep_mu,
                 "timestep_sigma": self.timestep_sigma,
                 "data_proportion": self.data_proportion,
@@ -277,6 +400,34 @@ class TrainingConfigV2(TrainingConfig):
                 "dataset_json": self.dataset_json,
                 "tensor_output": self.tensor_output,
                 "max_duration": self.max_duration,
+                # Phase D: timing branch
+                "enable_timing_branch": self.enable_timing_branch,
+                "timing_dir": self.timing_dir,
+                "timing_hidden_size": self.timing_hidden_size,
+                "timing_num_heads": self.timing_num_heads,
+                "timing_num_layers": self.timing_num_layers,
+                "timing_output_dim": self.timing_output_dim,
+                "timing_dropout": self.timing_dropout,
+                "timing_loss_weight": self.timing_loss_weight,
+                "timing_dur_weight": self.timing_dur_weight,
+                "timing_onset_weight": self.timing_onset_weight,
+                "timing_pause_weight": self.timing_pause_weight,
+                "timing_phrase_weight": self.timing_phrase_weight,
+                "timing_tempo_weight": self.timing_tempo_weight,
+                "timing_terminal_weight": self.timing_terminal_weight,
+                "timing_condition_dropout": self.timing_condition_dropout,
+                "timing_condition_scale": self.timing_condition_scale,
+                "timing_use_stream_type_embedding": self.timing_use_stream_type_embedding,
+                "timing_decoder_loss_weight": self.timing_decoder_loss_weight,
+                "enable_timing_consumer_training": self.enable_timing_consumer_training,
+                "enable_phrase_modulation": self.enable_phrase_modulation,
+                "timing_global_condition_scale": self.timing_global_condition_scale,
+                "timing_global_bottleneck_dim": self.timing_global_bottleneck_dim,
+                "timing_train_last_n_layers": self.timing_train_last_n_layers,
+                "validate_every_n_epochs": self.validate_every_n_epochs,
+                "early_stopping_patience": self.early_stopping_patience,
+                "early_stopping_min_delta": self.early_stopping_min_delta,
+                "save_best_checkpoint": self.save_best_checkpoint,
             }
         )
         return base

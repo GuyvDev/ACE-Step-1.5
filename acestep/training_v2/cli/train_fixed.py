@@ -86,6 +86,11 @@ def run_fixed(args: argparse.Namespace) -> int:
                 variant=train_cfg.model_variant,
                 device=train_cfg.device,
                 precision=train_cfg.precision,
+                config_overrides={
+                    "timing_global_bottleneck_dim": getattr(
+                        train_cfg, "timing_global_bottleneck_dim", 8
+                    ),
+                },
             )
         except Exception as exc:
             handle_error(exc, context="Model loading", show_traceback=True)

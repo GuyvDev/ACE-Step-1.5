@@ -109,7 +109,7 @@ def run_basic_training_loop(
     tb = TrainingLogger(cfg.effective_log_dir)
     train_loader = data_module.train_dataloader()
 
-    trainable_params = [p for p in module.model.parameters() if p.requires_grad]
+    trainable_params = [p for p in module.parameters() if p.requires_grad]
     if not trainable_params:
         yield TrainingUpdate(0, 0.0, "[FAIL] No trainable parameters found", kind="fail")
         tb.close()

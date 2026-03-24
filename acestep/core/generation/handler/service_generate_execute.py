@@ -100,6 +100,14 @@ class ServiceGenerateExecuteMixin:
             "cfg_interval_end": cfg_interval_end,
             "shift": shift,
         }
+        timing_hidden_states = getattr(self, "inference_timing_hidden_states", None)
+        timing_attention_mask = getattr(self, "inference_timing_attention_mask", None)
+        timing_global_states = getattr(self, "inference_timing_global_states", None)
+        if timing_hidden_states is not None and timing_attention_mask is not None:
+            kwargs["timing_hidden_states"] = timing_hidden_states
+            kwargs["timing_attention_mask"] = timing_attention_mask
+        if timing_global_states is not None:
+            kwargs["timing_global_states"] = timing_global_states
         if timesteps is not None:
             kwargs["timesteps"] = torch.tensor(timesteps, dtype=torch.float32, device=self.device)
         return kwargs

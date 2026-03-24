@@ -25,8 +25,139 @@ from acestep.training.lokr_utils import (
     load_lokr_weights,
 )
 from acestep.training_v2.ui import TrainingUpdate
+from acestep.training_v2.mert_conditioning import load_saved_bridge
+from acestep.training_v2.timing_conditioning import load_saved_timing_module
 
 logger = logging.getLogger(__name__)
+
+
+def _unwrap_runtime_decoder(decoder: Any) -> Any:
+    """Strip Fabric wrappers while preserving the PEFT wrapper."""
+    while hasattr(decoder, "_forward_module"):
+        decoder = decoder._forward_module
+    return decoder
+
+
+def _collect_decoder_timing_state(module: Any) -> dict[str, torch.Tensor]:
+    """Collect decoder-side timing-attention weights for checkpointing."""
+    model = getattr(module, "model", None)
+    decoder = getattr(model, "decoder", None) if model is not None else None
+    if decoder is None:
+        return {}
+    raw_decoder = _unwrap_runtime_decoder(decoder)
+    timing_state = {
+        name: tensor.detach().cpu()
+        for name, tensor in raw_decoder.state_dict().items()
+        if "timing_" in name
+    }
+    return timing_state
+
+
+def _load_decoder_timing_state(module: Any, decoder_state: dict[str, torch.Tensor], source: Path) -> bool:
+    """Restore decoder-side timing-attention weights from checkpoint payload."""
+    model = getattr(module, "model", None)
+    decoder = getattr(model, "decoder", None) if model is not None else None
+    if decoder is None or not decoder_state:
+        return False
+    raw_decoder = _unwrap_runtime_decoder(decoder)
+    try:
+        missing, unexpected = raw_decoder.load_state_dict(decoder_state, strict=False)
+        logger.info(
+            "[OK] Loaded decoder timing weights from %s (%d tensors, missing=%d, unexpected=%d)",
+            source,
+            len(decoder_state),
+            len(missing),
+            len(unexpected),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("[WARN] Failed to load decoder timing weights from %s: %s", source, exc)
+        return False
+
+
+def _save_bridge_module(module: Any, output_dir: str) -> None:
+    voice_conditioner = getattr(module, "voice_conditioner", None)
+    if voice_conditioner is None:
+        return
+    bridge_path = os.path.join(output_dir, "mert_bridge.pt")
+    payload = {
+        "state_dict": voice_conditioner.state_dict(),
+        "config": voice_conditioner.export_config(),
+    }
+    torch.save(payload, bridge_path)
+    logger.info("[OK] Saved MERT bridge weights to %s", bridge_path)
+
+
+def _load_bridge_module(module: Any, checkpoint_dir: Path) -> bool:
+    voice_conditioner = getattr(module, "voice_conditioner", None)
+    bridge_path = checkpoint_dir / "mert_bridge.pt"
+    if voice_conditioner is None or not bridge_path.exists():
+        return False
+    payload = load_saved_bridge(str(bridge_path), map_location=module.device)
+    voice_conditioner.load_state_dict(payload["state_dict"], strict=True)
+    logger.info("[OK] Loaded MERT bridge weights from %s", bridge_path)
+    return True
+
+
+def _save_timing_module(module: Any, output_dir: str) -> None:
+    """Save timing encoder weights alongside LoRA adapter weights."""
+    timing_encoder = getattr(module, "timing_encoder", None)
+    decoder_timing_supervisor = getattr(module, "decoder_timing_supervisor", None)
+    decoder_timing_state = _collect_decoder_timing_state(module)
+    if timing_encoder is None and decoder_timing_supervisor is None and not decoder_timing_state:
+        return
+    timing_path = os.path.join(output_dir, "timing_branch.pt")
+    payload = {}
+    if timing_encoder is not None:
+        payload["state_dict"] = timing_encoder.state_dict()
+        payload["config"] = timing_encoder.export_config()
+    if decoder_timing_supervisor is not None:
+        payload["decoder_state_dict"] = decoder_timing_supervisor.state_dict()
+    if decoder_timing_state:
+        payload["decoder_model_state_dict"] = decoder_timing_state
+    torch.save(payload, timing_path)
+    logger.info("[OK] Saved timing branch weights to %s", timing_path)
+
+
+def _load_timing_module(module: Any, checkpoint_dir: Path) -> bool:
+    """Load timing encoder weights from a checkpoint directory."""
+    timing_encoder = getattr(module, "timing_encoder", None)
+    decoder_timing_supervisor = getattr(module, "decoder_timing_supervisor", None)
+    timing_path = checkpoint_dir / "timing_branch.pt"
+    if (timing_encoder is None and decoder_timing_supervisor is None) or not timing_path.exists():
+        return False
+    try:
+        payload = load_saved_timing_module(str(timing_path), map_location=module.device)
+        if timing_encoder is not None and "state_dict" in payload:
+            try:
+                timing_encoder.load_state_dict(payload["state_dict"], strict=True)
+                logger.info("[OK] Loaded timing branch weights from %s", timing_path)
+            except Exception as strict_err:
+                logger.warning(
+                    "[WARN] Strict timing-branch load failed for %s: %s; retrying non-strict",
+                    timing_path,
+                    strict_err,
+                )
+                timing_encoder.load_state_dict(payload["state_dict"], strict=False)
+                logger.info("[OK] Loaded timing branch weights non-strictly from %s", timing_path)
+        if decoder_timing_supervisor is not None and "decoder_state_dict" in payload:
+            try:
+                decoder_timing_supervisor.load_state_dict(payload["decoder_state_dict"], strict=True)
+                logger.info("[OK] Loaded decoder timing supervisor from %s", timing_path)
+            except Exception as strict_err:
+                logger.warning(
+                    "[WARN] Strict decoder timing-supervisor load failed for %s: %s; retrying non-strict",
+                    timing_path,
+                    strict_err,
+                )
+                decoder_timing_supervisor.load_state_dict(payload["decoder_state_dict"], strict=False)
+                logger.info("[OK] Loaded decoder timing supervisor non-strictly from %s", timing_path)
+        if "decoder_model_state_dict" in payload:
+            _load_decoder_timing_state(module, payload["decoder_model_state_dict"], timing_path)
+        return True
+    except Exception as e:
+        logger.warning("[WARN] Failed to load timing branch from %s: %s", timing_path, e)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +313,9 @@ def save_adapter_flat(trainer: Any, output_dir: str) -> None:
         else:
             # Fallback for non-PEFT models
             save_lora_weights(module.model, output_dir)
+
+    _save_bridge_module(module, output_dir)
+    _save_timing_module(module, output_dir)
 
 
 def save_checkpoint(
@@ -351,10 +485,14 @@ def resume_checkpoint(
                 f"[OK] Resumed LoKR from epoch {epoch}, step {step}",
                 kind="info",
             )
+            _load_bridge_module(module, ckpt_dir)
+            _load_timing_module(module, ckpt_dir)
             return (epoch, step)
         yield TrainingUpdate(
             0, 0.0, "[OK] LoKR weights loaded (no training state)", kind="info"
         )
+        _load_bridge_module(module, ckpt_dir)
+        _load_timing_module(module, ckpt_dir)
         return None
 
     # Warn if LoKR was expected but checkpoint is LoRA-format
@@ -396,6 +534,8 @@ def resume_checkpoint(
             if hasattr(decoder, "_forward_module"):
                 decoder = decoder._forward_module
             decoder.load_state_dict(state_dict, strict=False)
+            bridge_loaded = _load_bridge_module(module, ckpt_dir)
+            timing_loaded = _load_timing_module(module, ckpt_dir)
 
             start_epoch = ckpt_info["epoch"]
             g_step = ckpt_info["global_step"]
@@ -404,6 +544,10 @@ def resume_checkpoint(
                 parts.append("optimizer OK")
             if ckpt_info["loaded_scheduler"]:
                 parts.append("scheduler OK")
+            if bridge_loaded:
+                parts.append("MERT bridge OK")
+            if timing_loaded:
+                parts.append("timing branch OK")
             yield TrainingUpdate(0, 0.0, ", ".join(parts), kind="info")
             return (start_epoch, g_step)
         yield TrainingUpdate(

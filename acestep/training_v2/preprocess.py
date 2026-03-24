@@ -36,6 +36,7 @@ from acestep.training_v2.preprocess_vae import (
     TARGET_SR as _TARGET_SR,
     tiled_vae_encode as _tiled_vae_encode,
 )
+from acestep.training_v2.mert_conditioning import FrozenMERTFeatureExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +218,28 @@ def _pass1_light(
     silence_latent = load_silence_latent(
         checkpoint_dir, device, precision, variant=variant
     )
+    mert_extractor: Optional[FrozenMERTFeatureExtractor] = None
+
+    use_mert_conditioning = bool(ds_meta.get("use_mert_conditioning", False))
+    if use_mert_conditioning:
+        has_ref_voice = any(
+            bool(sm.get("ref_voice_audio_path"))
+            for sm in sample_meta.values()
+        )
+        if has_ref_voice:
+            mert_model_name = str(ds_meta.get("mert_model_name_or_path", "m-a-p/MERT-v1-330M"))
+            mert_local_only = bool(ds_meta.get("mert_local_files_only", True))
+            logger.info(
+                "[Side-Step] Loading frozen MERT extractor (%s, local_only=%s)",
+                mert_model_name,
+                mert_local_only,
+            )
+            mert_extractor = FrozenMERTFeatureExtractor(
+                model_name_or_path=mert_model_name,
+                device=device,
+                dtype=dtype,
+                local_files_only=mert_local_only,
+            )
 
     intermediates: List[Path] = []
     failed = 0
@@ -290,40 +313,71 @@ def _pass1_light(
                         text_enc, tokenizer, lyrics, device, dtype
                     )
 
+                ref_voice_hidden_states = None
+                ref_voice_attention_mask = None
+                ref_voice_audio_path = sm.get("ref_voice_audio_path")
+                if ref_voice_audio_path and mert_extractor is not None:
+                    ref_start = float(sm.get("ref_voice_start_sec", 0.0) or 0.0)
+                    ref_duration = float(
+                        sm.get(
+                            "ref_voice_duration_sec",
+                            ds_meta.get("max_ref_voice_duration", 3.0),
+                        )
+                        or ds_meta.get("max_ref_voice_duration", 3.0)
+                    )
+                    try:
+                        ref_voice_hidden_states, ref_voice_attention_mask = mert_extractor.extract_from_file(
+                            str(ref_voice_audio_path),
+                            start_sec=ref_start,
+                            duration_sec=ref_duration,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[Side-Step] Failed to extract MERT features for %s: %s",
+                            ref_voice_audio_path,
+                            exc,
+                        )
+
                 # 4. Save intermediate
                 tmp_path = out_path / f"{sample_id}.tmp.pt"
-                torch.save(
-                    {
-                        "target_latents": target_latents.squeeze(0).cpu(),
-                        "attention_mask": attention_mask.squeeze(0).cpu(),
-                        "text_hidden_states": text_hs.cpu(),
-                        "text_attention_mask": text_mask.cpu(),
-                        "lyric_hidden_states": lyric_hs.cpu(),
-                        "lyric_attention_mask": lyric_mask.cpu(),
-                        "silence_latent": silence_latent.cpu(),
-                        "latent_length": latent_length,
-                        "metadata": {
-                            "sample_id": sample_id,
-                            "audio_path": str(af),
-                            "filename": sm.get("filename", af.name),
-                            "caption": caption,
-                            "lyrics": lyrics,
-                            "duration": sm.get("duration", 0),
-                            "bpm": sm.get("bpm"),
-                            "keyscale": sm.get("keyscale", ""),
-                            "timesignature": sm.get("timesignature", ""),
-                            "genre": sm.get("genre", ""),
-                            "is_instrumental": sm.get("is_instrumental", True),
-                            "custom_tag": sm.get("custom_tag", ""),
-                            "prompt_override": sm.get("prompt_override"),
-                        },
+                payload = {
+                    "target_latents": target_latents.squeeze(0).cpu(),
+                    "attention_mask": attention_mask.squeeze(0).cpu(),
+                    "text_hidden_states": text_hs.cpu(),
+                    "text_attention_mask": text_mask.cpu(),
+                    "lyric_hidden_states": lyric_hs.cpu(),
+                    "lyric_attention_mask": lyric_mask.cpu(),
+                    "silence_latent": silence_latent.cpu(),
+                    "latent_length": latent_length,
+                    "metadata": {
+                        "sample_id": sample_id,
+                        "audio_path": str(af),
+                        "filename": sm.get("filename", af.name),
+                        "caption": caption,
+                        "lyrics": lyrics,
+                        "duration": sm.get("duration", 0),
+                        "bpm": sm.get("bpm"),
+                        "keyscale": sm.get("keyscale", ""),
+                        "timesignature": sm.get("timesignature", ""),
+                        "genre": sm.get("genre", ""),
+                        "is_instrumental": sm.get("is_instrumental", True),
+                        "custom_tag": sm.get("custom_tag", ""),
+                        "prompt_override": sm.get("prompt_override"),
+                        "ref_voice_audio_path": sm.get("ref_voice_audio_path"),
+                        "ref_voice_start_sec": sm.get("ref_voice_start_sec"),
+                        "ref_voice_duration_sec": sm.get("ref_voice_duration_sec"),
                     },
-                    tmp_path,
-                )
+                }
+                if ref_voice_hidden_states is not None and ref_voice_attention_mask is not None:
+                    payload["ref_voice_features"] = ref_voice_hidden_states.cpu()
+                    payload["ref_voice_attention_mask"] = ref_voice_attention_mask.cpu()
+
+                torch.save(payload, tmp_path)
 
                 # Free GPU tensors from this iteration before the next one
                 del target_latents, attention_mask, text_hs, text_mask
                 del lyric_hs, lyric_mask
+                del ref_voice_hidden_states, ref_voice_attention_mask
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -448,17 +502,23 @@ def _pass2_heavy(
                 base_name = tmp_path.name.replace(".tmp.pt", ".pt")
                 final_path = out_path / base_name
                 meta = data["metadata"]
-                torch.save(
-                    {
-                        "target_latents": data["target_latents"],
-                        "attention_mask": data["attention_mask"],
-                        "encoder_hidden_states": encoder_hs.squeeze(0).cpu(),
-                        "encoder_attention_mask": encoder_mask.squeeze(0).cpu(),
-                        "context_latents": context_latents.squeeze(0).cpu(),
-                        "metadata": meta,
-                    },
-                    final_path,
-                )
+                final_payload = {
+                    "target_latents": data["target_latents"],
+                    "attention_mask": data["attention_mask"],
+                    "encoder_hidden_states": encoder_hs.squeeze(0).cpu(),
+                    "encoder_attention_mask": encoder_mask.squeeze(0).cpu(),
+                    "context_latents": context_latents.squeeze(0).cpu(),
+                    "metadata": meta,
+                }
+                if "ref_voice_features" in data and "ref_voice_attention_mask" in data:
+                    final_payload["ref_voice_features"] = data["ref_voice_features"]
+                    final_payload["ref_voice_attention_mask"] = data["ref_voice_attention_mask"]
+                    final_payload["text_hidden_states"] = data["text_hidden_states"]
+                    final_payload["text_attention_mask"] = data["text_attention_mask"]
+                    final_payload["lyric_hidden_states"] = data["lyric_hidden_states"]
+                    final_payload["lyric_attention_mask"] = data["lyric_attention_mask"]
+
+                torch.save(final_payload, final_path)
 
                 # Free all GPU tensors and the loaded data dict before next iter
                 del encoder_hs, encoder_mask, context_latents, data

@@ -41,6 +41,7 @@ from acestep.training_v2.fixed_lora_module import (
     _select_compute_dtype,
     _select_fabric_precision,
 )
+from acestep.training_v2.model_loader import _resolve_dtype
 from acestep.training_v2.trainer_helpers import (
     configure_memory_features,
     offload_non_decoder,
@@ -62,6 +63,24 @@ try:
 except ImportError:
     _FABRIC_AVAILABLE = False
     logger.warning("[WARN] Lightning Fabric not installed. Training will use basic loop.")
+
+
+def _resolve_requested_compute_dtype(precision: str, device_type: str) -> torch.dtype:
+    if precision == "auto":
+        return _select_compute_dtype(device_type)
+    return _resolve_dtype(precision)
+
+
+def _resolve_requested_fabric_precision(precision: str, device_type: str) -> str:
+    if precision == "auto":
+        return _select_fabric_precision(device_type)
+
+    mapping = {
+        "bf16": "bf16-mixed",
+        "fp16": "16-mixed",
+        "fp32": "32-true",
+    }
+    return mapping.get(precision, _select_fabric_precision(device_type))
 
 
 # ===========================================================================
@@ -124,7 +143,10 @@ class FixedLoRATrainer:
 
             # -- Build module -----------------------------------------------
             device = torch.device(cfg.device)
-            dtype = _select_compute_dtype(_normalize_device_type(device))
+            dtype = _resolve_requested_compute_dtype(
+                getattr(cfg, "precision", "auto"),
+                _normalize_device_type(device),
+            )
 
             self.module = FixedLoRAModule(
                 model=self.model,
@@ -141,6 +163,8 @@ class FixedLoRATrainer:
                 logger.info("[Side-Step] Windows detected -- setting num_workers=0 (spawn incompatible)")
                 num_workers = 0
 
+            # Phase D: pass timing_dir so dataset can load timing sidecars
+            _timing_dir = getattr(cfg, "timing_dir", None) if getattr(cfg, "enable_timing_branch", False) else None
             data_module = PreprocessedDataModule(
                 tensor_dir=cfg.dataset_dir,
                 batch_size=cfg.batch_size,
@@ -149,6 +173,8 @@ class FixedLoRATrainer:
                 prefetch_factor=cfg.prefetch_factor if num_workers > 0 else None,
                 persistent_workers=cfg.persistent_workers if num_workers > 0 else False,
                 pin_memory_device=cfg.pin_memory_device,
+                val_split=getattr(cfg, "val_split", 0.0),
+                timing_dir=_timing_dir,
             )
             data_module.setup("fit")
 
@@ -226,7 +252,10 @@ class FixedLoRATrainer:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         device_type = self.module.device_type
-        precision = _select_fabric_precision(device_type)
+        precision = _resolve_requested_fabric_precision(
+            getattr(cfg, "precision", "auto"),
+            device_type,
+        )
         accelerator = device_type if device_type in ("cuda", "xpu", "mps", "cpu") else "auto"
 
         # -- Fabric init ----------------------------------------------------
@@ -253,9 +282,10 @@ class FixedLoRATrainer:
 
         # -- Dataloader -----------------------------------------------------
         train_loader = data_module.train_dataloader()
+        val_loader = data_module.val_dataloader()
 
         # -- Trainable params / optimizer -----------------------------------
-        trainable_params = [p for p in self.module.model.parameters() if p.requires_grad]
+        trainable_params = [p for p in self.module.parameters() if p.requires_grad]
         if not trainable_params:
             yield TrainingUpdate(0, 0.0, "[FAIL] No trainable parameters found", kind="fail")
             tb.close()
@@ -324,6 +354,9 @@ class FixedLoRATrainer:
         # -- dtype / Fabric setup -------------------------------------------
         self.module.model = self.module.model.to(self.module.dtype)
         self.module.model.decoder, optimizer = self.fabric.setup(self.module.model.decoder, optimizer)
+        train_loader = self.fabric.setup_dataloaders(train_loader)
+        if val_loader is not None:
+            val_loader = self.fabric.setup_dataloaders(val_loader)
 
         # -- Resume ---------------------------------------------------------
         start_epoch = 0
@@ -348,6 +381,14 @@ class FixedLoRATrainer:
         accumulated_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
         self.module.model.decoder.train()
+        best_val_loss = float("inf")
+        best_ckpt_dir: Optional[str] = None
+        epochs_without_improvement = 0
+        validate_every = max(1, int(getattr(cfg, "validate_every_n_epochs", 1)))
+        early_patience = max(0, int(getattr(cfg, "early_stopping_patience", 0)))
+        early_min_delta = max(0.0, float(getattr(cfg, "early_stopping_min_delta", 0.0)))
+        save_best_checkpoint = bool(getattr(cfg, "save_best_checkpoint", True))
+        should_stop_early = False
 
         for epoch in range(start_epoch, cfg.max_epochs):
             epoch_loss = 0.0
@@ -443,6 +484,59 @@ class FixedLoRATrainer:
                 kind="epoch", epoch=epoch + 1, max_epochs=cfg.max_epochs, epoch_time=epoch_time,
             )
 
+            if val_loader is not None and ((epoch + 1) % validate_every == 0):
+                self.module.model.decoder.eval()
+                total_val_loss = 0.0
+                n_val = 0
+                with torch.no_grad():
+                    for val_batch in val_loader:
+                        v_loss = self.module.training_step(val_batch, record_loss=False)
+                        total_val_loss += float(v_loss.item())
+                        n_val += 1
+                self.module.model.decoder.train()
+
+                val_loss = total_val_loss / max(n_val, 1)
+                tb.log_scalar("val/loss", val_loss, epoch + 1)
+                yield TrainingUpdate(
+                    step=global_step,
+                    loss=val_loss,
+                    msg=f"[INFO] Validation after epoch {epoch + 1}: loss={val_loss:.4f}",
+                    kind="info",
+                    epoch=epoch + 1,
+                    max_epochs=cfg.max_epochs,
+                )
+
+                if val_loss < (best_val_loss - early_min_delta):
+                    best_val_loss = val_loss
+                    epochs_without_improvement = 0
+                    if save_best_checkpoint:
+                        best_ckpt_dir = str(output_dir / "checkpoints" / "best")
+                        self._save_checkpoint(optimizer, scheduler, epoch + 1, global_step, best_ckpt_dir)
+                        yield TrainingUpdate(
+                            step=global_step,
+                            loss=val_loss,
+                            msg=f"[OK] New best checkpoint saved (val_loss={val_loss:.4f})",
+                            kind="checkpoint",
+                            epoch=epoch + 1,
+                            max_epochs=cfg.max_epochs,
+                            checkpoint_path=best_ckpt_dir,
+                        )
+                else:
+                    epochs_without_improvement += 1
+                    if early_patience > 0 and epochs_without_improvement >= early_patience:
+                        should_stop_early = True
+                        yield TrainingUpdate(
+                            step=global_step,
+                            loss=val_loss,
+                            msg=(
+                                f"[INFO] Early stopping triggered after epoch {epoch + 1} "
+                                f"(best_val_loss={best_val_loss:.4f}, last_val_loss={val_loss:.4f})"
+                            ),
+                            kind="complete",
+                            epoch=epoch + 1,
+                            max_epochs=cfg.max_epochs,
+                        )
+
             # Checkpoint
             if (epoch + 1) % cfg.save_every_n_epochs == 0:
                 ckpt_dir = str(output_dir / "checkpoints" / f"epoch_{epoch + 1}_loss_{avg_epoch_loss:.4f}")
@@ -458,6 +552,8 @@ class FixedLoRATrainer:
             # temporaries are also freed.
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            if should_stop_early:
+                break
 
         # -- Sanity check: did we actually train? ----------------------------
         if global_step == 0:
@@ -488,6 +584,7 @@ class FixedLoRATrainer:
             msg=(
                 f"[OK] Training complete! {adapter_label} saved to {final_path}\n"
                 f"     For inference, set your LoRA path to: {final_path}"
+                + (f"\n     Best validation checkpoint: {best_ckpt_dir}" if best_ckpt_dir else "")
             ),
             kind="complete",
         )

@@ -107,7 +107,9 @@ def load_sample_metadata(
             raw = json.loads(Path(dataset_json).read_text(encoding="utf-8"))
             samples = raw if isinstance(raw, list) else raw.get("samples", [])
             json_dir = Path(dataset_json).parent
+            sample_records = 0
             for s in samples:
+                sample_records += 1
                 # Primary key: resolved audio_path (unique and collision-free)
                 audio_path = s.get("audio_path", "")
                 if audio_path:
@@ -132,7 +134,12 @@ def load_sample_metadata(
                     basename = Path(s["audio_path"]).name
                     if basename and basename not in meta:
                         meta[basename] = s
-            logger.info("[Side-Step] Loaded metadata for %d samples from %s", len(meta), dataset_json)
+            logger.info(
+                "[Side-Step] Loaded metadata from %s: %d sample records (%d lookup aliases)",
+                dataset_json,
+                sample_records,
+                len(meta),
+            )
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("[Side-Step] Failed to load dataset JSON: %s", exc)
 
@@ -173,6 +180,10 @@ def load_dataset_metadata(dataset_json: Optional[str]) -> Dict[str, Any]:
         "tag_position": "prepend",
         "genre_ratio": 0,
         "custom_tag": "",
+        "use_mert_conditioning": False,
+        "mert_model_name_or_path": "m-a-p/MERT-v1-330M",
+        "mert_local_files_only": True,
+        "max_ref_voice_duration": 3.0,
     }
     if not dataset_json or not Path(dataset_json).is_file():
         return defaults
@@ -190,6 +201,10 @@ def load_dataset_metadata(dataset_json: Optional[str]) -> Dict[str, Any]:
         "tag_position": meta.get("tag_position", "prepend"),
         "genre_ratio": meta.get("genre_ratio", 0),
         "custom_tag": meta.get("custom_tag", ""),
+        "use_mert_conditioning": meta.get("use_mert_conditioning", False),
+        "mert_model_name_or_path": meta.get("mert_model_name_or_path", "m-a-p/MERT-v1-330M"),
+        "mert_local_files_only": meta.get("mert_local_files_only", True),
+        "max_ref_voice_duration": meta.get("max_ref_voice_duration", 3.0),
     }
 
 

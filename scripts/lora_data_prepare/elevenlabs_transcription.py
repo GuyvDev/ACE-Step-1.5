@@ -69,6 +69,7 @@ def transcribe_elevenlabs(
     api_url: str = "https://api.elevenlabs.io/v1",
     model: str = "scribe_v2",
     language: Optional[str] = None,
+    upload_filename: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Transcribe audio using ElevenLabs Scribe API.
 
@@ -78,6 +79,7 @@ def transcribe_elevenlabs(
         api_url: ElevenLabs API base URL
         model: Scribe model name
         language: Optional language code (e.g. "zh", "en", "ja")
+        upload_filename: Optional name used in multipart upload (e.g. "audio.wav")
 
     Returns:
         List of word-level timestamps [{word, start, end}, ...]
@@ -93,7 +95,8 @@ def transcribe_elevenlabs(
         data["language_code"] = language
 
     with open(audio_path, "rb") as f:
-        files = {"file": (Path(audio_path).name, f)}
+        multipart_name = upload_filename or Path(audio_path).name
+        files = {"file": (multipart_name, f)}
         response = requests.post(url, headers=headers, data=data, files=files, timeout=300)
 
     if response.status_code != 200:
@@ -127,6 +130,7 @@ def transcribe_to_file(
     model: str = "scribe_v2",
     language: Optional[str] = None,
     line_gap: float = 1.5,
+    upload_filename: Optional[str] = None,
 ) -> str:
     """Transcribe audio and save plain lyrics text to file.
 
@@ -138,11 +142,19 @@ def transcribe_to_file(
         model: Scribe model name
         language: Optional language code
         line_gap: Gap threshold (seconds) for line breaking
+        upload_filename: Optional name used in multipart upload
 
     Returns:
         Path to the output file
     """
-    words = transcribe_elevenlabs(audio_path, api_key, api_url, model, language)
+    words = transcribe_elevenlabs(
+        audio_path,
+        api_key,
+        api_url,
+        model,
+        language,
+        upload_filename,
+    )
 
     if not words:
         raise RuntimeError("No word-level timestamps returned from ElevenLabs API")
@@ -165,6 +177,7 @@ def process_folder(
     model: str = "scribe_v2",
     language: Optional[str] = None,
     line_gap: float = 1.5,
+    upload_filename: Optional[str] = None,
 ) -> List[str]:
     """Transcribe all audio files in a folder.
 
@@ -176,6 +189,7 @@ def process_folder(
         model: Scribe model name
         language: Optional language code
         line_gap: Gap threshold (seconds) for line breaking
+        upload_filename: Optional name used in multipart upload
 
     Returns:
         List of output file paths
@@ -209,6 +223,7 @@ def process_folder(
                 model=model,
                 language=language,
                 line_gap=line_gap,
+                upload_filename=upload_filename,
             )
             output_paths.append(str(output_file))
             print(f"  -> {output_file.name}")

@@ -212,6 +212,7 @@ def _add_common_training_args(parser: argparse.ArgumentParser) -> None:
     g_train.add_argument("--weight-decay", type=float, default=0.01, help="AdamW weight decay (default: 0.01)")
     g_train.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping norm (default: 1.0)")
     g_train.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
+    g_train.add_argument("--val-split", type=float, default=0.0, help="Fraction of the tensor dataset to reserve for validation (default: 0.0)")
     g_train.add_argument("--shift", type=float, default=3.0, help="Noise schedule shift (turbo=3.0, base/sft=1.0)")
     g_train.add_argument("--num-inference-steps", type=int, default=8, help="Inference steps for timestep schedule (turbo=8, base/sft=50)")
     g_train.add_argument("--optimizer-type", type=str, default="adamw", choices=["adamw", "adamw8bit", "adafactor", "prodigy"], help="Optimizer (default: adamw)")
@@ -254,6 +255,10 @@ def _add_common_training_args(parser: argparse.ArgumentParser) -> None:
     g_log.add_argument("--log-every", type=int, default=10, help="Log basic metrics every N steps (default: 10)")
     g_log.add_argument("--log-heavy-every", type=int, default=50, help="Log per-layer gradient norms every N steps (default: 50)")
     g_log.add_argument("--sample-every-n-epochs", type=int, default=0, help="Generate audio sample every N epochs; 0=disabled (default: 0)")
+    g_log.add_argument("--validate-every", type=int, default=1, help="Run validation every N epochs when val_split > 0 (default: 1)")
+    g_log.add_argument("--early-stopping-patience", type=int, default=0, help="Stop after this many non-improving validations; 0 disables (default: 0)")
+    g_log.add_argument("--early-stopping-min-delta", type=float, default=0.0, help="Minimum validation improvement to reset patience (default: 0.0)")
+    g_log.add_argument("--save-best-checkpoint", action=argparse.BooleanOptionalAction, default=True, help="Save a rolling best checkpoint when validation improves")
 
     # -- Preprocessing -------------------------------------------------------
     g_pre = parser.add_argument_group("Preprocessing")
@@ -268,6 +273,204 @@ def _add_fixed_args(parser: argparse.ArgumentParser) -> None:
     """Add arguments specific to the fixed subcommand."""
     g = parser.add_argument_group("Corrected training")
     g.add_argument("--cfg-ratio", type=float, default=0.15, help="CFG dropout probability (default: 0.15)")
+    g.add_argument(
+        "--f0-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary F0-contour consistency loss weight (default: 0.0, disabled)",
+    )
+    g.add_argument(
+        "--speaker-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary speaker-consistency loss weight (default: 0.0, disabled)",
+    )
+    g.add_argument(
+        "--use-mert-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable optional precomputed MERT reference-voice conditioning",
+    )
+    g.add_argument(
+        "--mert-model-name-or-path",
+        type=str,
+        default="m-a-p/MERT-v1-330M",
+        help="Model name or local path used for MERT preprocessing",
+    )
+    g.add_argument(
+        "--mert-local-files-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require the MERT model to exist locally during preprocessing (default: True)",
+    )
+    g.add_argument(
+        "--mert-hidden-size",
+        type=int,
+        default=1024,
+        help="Hidden size of the precomputed MERT features (default: 1024)",
+    )
+    g.add_argument(
+        "--mert-num-layers",
+        type=int,
+        default=25,
+        help="Expected number of MERT hidden-state layers in precomputed features (default: 25)",
+    )
+    g.add_argument(
+        "--voice-condition-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout applied after projecting reference voice states (default: 0.1)",
+    )
+    g.add_argument(
+        "--voice-condition-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to projected voice states before concatenation (default: 1.0)",
+    )
+    g.add_argument(
+        "--max-ref-voice-duration",
+        type=float,
+        default=3.0,
+        help="Maximum reference clip duration during preprocessing (default: 3.0)",
+    )
+    g.add_argument(
+        "--enable-timing-branch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the Phase D timing/prosody conditioning branch",
+    )
+    g.add_argument(
+        "--timing-dir",
+        type=str,
+        default=None,
+        help="Directory containing .timing.pt sidecars aligned to the tensor dataset",
+    )
+    g.add_argument(
+        "--timing-hidden-size",
+        type=int,
+        default=256,
+        help="Hidden size of the timing encoder (default: 256)",
+    )
+    g.add_argument(
+        "--timing-num-heads",
+        type=int,
+        default=4,
+        help="Number of attention heads in the timing encoder (default: 4)",
+    )
+    g.add_argument(
+        "--timing-num-layers",
+        type=int,
+        default=2,
+        help="Number of transformer layers in the timing encoder (default: 2)",
+    )
+    g.add_argument(
+        "--timing-output-dim",
+        type=int,
+        default=0,
+        help="Projection size into the DiT conditioning space; 0 = auto (default: 0)",
+    )
+    g.add_argument(
+        "--timing-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout inside the timing encoder (default: 0.1)",
+    )
+    g.add_argument(
+        "--timing-loss-weight",
+        type=float,
+        default=1.0,
+        help="Global timing auxiliary loss weight (default: 1.0)",
+    )
+    g.add_argument(
+        "--timing-dur-weight",
+        type=float,
+        default=1.0,
+        help="Duration sub-loss weight (default: 1.0)",
+    )
+    g.add_argument(
+        "--timing-onset-weight",
+        type=float,
+        default=0.5,
+        help="Onset-deviation sub-loss weight (default: 0.5)",
+    )
+    g.add_argument(
+        "--timing-pause-weight",
+        type=float,
+        default=0.5,
+        help="Pause sub-loss weight (default: 0.5)",
+    )
+    g.add_argument(
+        "--timing-phrase-weight",
+        type=float,
+        default=0.3,
+        help="Phrase-boundary / phrase-break sub-loss weight (default: 0.3)",
+    )
+    g.add_argument(
+        "--timing-tempo-weight",
+        type=float,
+        default=0.2,
+        help="Local tempo / rubato sub-loss weight (default: 0.2)",
+    )
+    g.add_argument(
+        "--timing-terminal-weight",
+        type=float,
+        default=0.2,
+        help="Phrase-final terminal-shaping sub-loss weight (default: 0.2)",
+    )
+    g.add_argument(
+        "--timing-condition-dropout",
+        type=float,
+        default=0.1,
+        help="Drop timing conditioning on a fraction of steps for robustness (default: 0.1)",
+    )
+    g.add_argument(
+        "--timing-condition-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to the projected timing stream before decoder timing attention (default: 1.0)",
+    )
+    g.add_argument(
+        "--timing-use-stream-type-embedding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add a learned stream-type embedding to mark timing states in decoder context",
+    )
+    g.add_argument(
+        "--timing-decoder-loss-weight",
+        type=float,
+        default=1.0,
+        help="Weight for decoder-coupled timing supervision on pooled output trajectories (default: 1.0)",
+    )
+    g.add_argument(
+        "--enable-timing-consumer-training",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train the decoder timing consumer weights, norms, and gates instead of gate-only timing usage (default: True)",
+    )
+    g.add_argument(
+        "--enable-phrase-modulation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable phrase/global timing-state modulation on top of event timing attention (default: False)",
+    )
+    g.add_argument(
+        "--timing-global-condition-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to the phrase/global timing modulation vector before decoder use (default: 1.0)",
+    )
+    g.add_argument(
+        "--timing-global-bottleneck-dim",
+        type=int,
+        default=8,
+        help="Bottleneck width for phrase/global modulation (default: 8; smaller is safer on tiny datasets)",
+    )
+    g.add_argument(
+        "--timing-train-last-n-layers",
+        type=int,
+        default=0,
+        help="Train timing-consumer parameters only in the last N decoder layers (default: 0 = all layers)",
+    )
 
 
 

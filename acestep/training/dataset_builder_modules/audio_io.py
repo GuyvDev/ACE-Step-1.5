@@ -7,6 +7,19 @@ from loguru import logger
 from acestep.training.path_safety import safe_path
 
 
+def _safe_or_local_path(path: str) -> str:
+    """Return a path validated by safe_path, with local-path fallback for symlink sidecars.
+
+    Sidecar datasets often store audio as symlinks whose targets may sit outside
+    the current training safe root. In that case we keep the local symlink path
+    (normalized absolute path) so adjacent sidecar text files still resolve.
+    """
+    try:
+        return safe_path(path)
+    except ValueError:
+        return os.path.normpath(os.path.abspath(path))
+
+
 def _read_text_file(path: str) -> Tuple[str, bool]:
     """Read a text file; return (content.strip(), True) if present and non-empty.
 
@@ -29,7 +42,7 @@ def _read_text_file(path: str) -> Tuple[str, bool]:
 
 def load_caption_file(audio_path: str) -> Tuple[str, bool]:
     """Load caption from <basename>.caption.txt (explicit convention)."""
-    validated = safe_path(audio_path)
+    validated = _safe_or_local_path(audio_path)
     base_path = os.path.splitext(validated)[0]
     caption_path = base_path + ".caption.txt"
     content, ok = _read_text_file(caption_path)
@@ -52,7 +65,7 @@ def load_json_metadata(audio_path: str) -> Tuple[Dict[str, Any], bool]:
 
     All fields are optional.
     """
-    validated = safe_path(audio_path)
+    validated = _safe_or_local_path(audio_path)
     base_path = os.path.splitext(validated)[0]
     json_path = base_path + ".json"
     if not os.path.exists(json_path):
@@ -71,7 +84,7 @@ def load_json_metadata(audio_path: str) -> Tuple[Dict[str, Any], bool]:
 
 def load_lyrics_file(audio_path: str) -> Tuple[str, bool]:
     """Load lyrics from <basename>.lyrics.txt, then fallback to <basename>.txt for backward compat."""
-    validated = safe_path(audio_path)
+    validated = _safe_or_local_path(audio_path)
     base_path = os.path.splitext(validated)[0]
     for suffix in (".lyrics.txt", ".txt"):
         path = base_path + suffix
@@ -87,7 +100,7 @@ def load_lyrics_file(audio_path: str) -> Tuple[str, bool]:
 
 def get_audio_duration(audio_path: str) -> int:
     """Get the duration of an audio file in seconds."""
-    validated = safe_path(audio_path)
+    validated = _safe_or_local_path(audio_path)
     # Primary: torchcodec (ships with torchaudio >=2.9, supports all ffmpeg formats)
     # Note: torchcodec is optional on ROCM/Intel platforms due to CUDA dependencies
     try:

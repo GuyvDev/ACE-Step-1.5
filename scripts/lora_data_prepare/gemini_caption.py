@@ -8,6 +8,8 @@ import os
 import base64
 import json
 import mimetypes
+import re
+import time
 from typing import Optional, List, Dict, Any, Tuple, Union, Generator
 from pathlib import Path
 
@@ -23,6 +25,8 @@ lyrics need contain structured tags for chorus, verse, bridge, etc.
 }
 ```
 """
+
+RETRY_DELAY_RE = re.compile(r"Please retry in\s+([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
 
 
 class GeminiService:
@@ -46,11 +50,12 @@ class GeminiService:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
+        self.last_error: Optional[Dict[str, Any]] = None
 
     def _get_endpoint(
         self, endpoint_type: str = "generate", model_name: Optional[str] = None
     ) -> str:
-        model = model_name or self.model_name
+        model = (model_name or self.model_name).removeprefix("models/")
 
         if endpoint_type == "generate":
             return f"{self.base_url}/v1beta/models/{model}:generateContent"
@@ -67,6 +72,26 @@ class GeminiService:
 
     def _get_headers(self) -> Dict[str, str]:
         return {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
+
+    def _retry_delay_seconds(self, response: requests.Response) -> float:
+        """Extract a retry delay from a quota response when available."""
+        retry_after = response.headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(float(retry_after), 1.0)
+            except ValueError:
+                pass
+
+        try:
+            body = response.json()
+            message = body.get("error", {}).get("message", "")
+        except Exception:
+            message = response.text
+
+        match = RETRY_DELAY_RE.search(message or "")
+        if match:
+            return max(float(match.group(1)), 1.0)
+        return 10.0
 
     def _encode_file_to_base64(self, file_path: str) -> str:
         with open(file_path, "rb") as f:
@@ -196,6 +221,7 @@ class GeminiService:
         generation_config: Optional[Dict[str, Any]] = None,
         history: Optional[List[Dict[str, Any]]] = None,
         model_name: Optional[str] = None,
+        max_retries: int = 120,
     ) -> Optional[Dict[str, Any]]:
         """Generate content with audio support.
 
@@ -209,6 +235,7 @@ class GeminiService:
             model_name: Optional model name to use for this request (overrides default)
         """
         try:
+            self.last_error = None
             body = self._build_request_body(
                 prompt=prompt,
                 audio=audio,
@@ -219,13 +246,39 @@ class GeminiService:
             )
 
             endpoint = self._get_endpoint("generate", model_name)
-            response = requests.post(
-                endpoint, headers=self._get_headers(), json=body, timeout=300
-            )
+            for attempt in range(max_retries + 1):
+                response = requests.post(
+                    endpoint, headers=self._get_headers(), json=body, timeout=300
+                )
 
-            if response.status_code == 200:
-                return response.json()
-            else:
+                if response.status_code == 200:
+                    return response.json()
+
+                if response.status_code == 429 and attempt < max_retries:
+                    delay = self._retry_delay_seconds(response)
+                    print(
+                        f"API call rate-limited: retrying in {delay:.2f}s "
+                        f"({attempt + 1}/{max_retries})"
+                    )
+                    time.sleep(delay)
+                    continue
+
+                error_status = "HTTP_ERROR"
+                error_message = response.text[:500]
+                try:
+                    error_body = response.json().get("error", {})
+                    error_status = str(error_body.get("status") or error_status)
+                    error_message = str(error_body.get("message") or error_message)
+                except Exception:
+                    error_body = {}
+
+                self.last_error = {
+                    "http_status": response.status_code,
+                    "status": error_status,
+                    "message": error_message,
+                    "raw": error_body,
+                }
+
                 print(
                     f"API call failed: {response.status_code} - {response.text[:500]}"
                 )
@@ -415,18 +468,54 @@ class GeminiService:
         self,
         audio_path: str,
         use_upload: bool = False,
-        model_name: Optional[str] = "gemini-3-pro-preview",
+        model_name: Optional[str] = "gemini-3-flash",
         **kwargs,
     ) -> Optional[str]:
         """Transcribe audio to text."""
-        response = self.analyze_audio(
-            audio_path=audio_path,
-            prompt="Please provide a complete transcription of this audio.",
-            use_upload=use_upload,
-            model_name=model_name,
-            **kwargs,
-        )
-        return self.extract_text(response) if response else None
+        generation_config = {
+            "responseMimeType": "text/plain",
+        }
+
+        if use_upload:
+            file_info = self.upload_file(audio_path)
+            if not file_info:
+                return None
+            response = self.generate_content(
+                prompt=(
+                    "Please provide a complete transcription of the sung lyrics in this audio. "
+                    "Return plain text only, with line breaks when natural. Do not add commentary, "
+                    "timestamps, JSON, or markdown fences."
+                ),
+                file_uris=[
+                    {
+                        "mime_type": file_info.get("mimeType"),
+                        "file_uri": file_info.get("uri"),
+                    }
+                ],
+                model_name=model_name,
+                generation_config=generation_config,
+                **kwargs,
+            )
+        else:
+            response = self.generate_content(
+                prompt=(
+                    "Please provide a complete transcription of the sung lyrics in this audio. "
+                    "Return plain text only, with line breaks when natural. Do not add commentary, "
+                    "timestamps, JSON, or markdown fences."
+                ),
+                audio=[audio_path],
+                model_name=model_name,
+                generation_config=generation_config,
+                **kwargs,
+            )
+
+        if response is None:
+            return None
+
+        data = self.extract_text(response)
+        if data is None:
+            return None
+        return data.replace("```", "").strip()
 
 
 _gemini_service = None
@@ -438,6 +527,8 @@ def get_gemini_service(
     model_name: str = "gemini-3-flash",
 ) -> GeminiService:
     global _gemini_service
+
+    api_key = api_key or os.getenv("GEMINI_API_KEY")
 
     if not api_key:
         raise ValueError(

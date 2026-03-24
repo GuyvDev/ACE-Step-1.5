@@ -135,6 +135,79 @@ def create_4d_mask(
     return mask_tensor
 
 
+def create_cross_attention_4d_mask(
+    query_len: int,
+    key_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Create a 4D additive mask for cross-attention with separate query/key lengths."""
+    valid_mask = torch.ones((1, 1, query_len, key_len), device=device, dtype=torch.bool)
+    if attention_mask is not None:
+        padding_mask_4d = attention_mask.view(attention_mask.shape[0], 1, 1, key_len).to(torch.bool)
+        valid_mask = valid_mask & padding_mask_4d
+
+    min_dtype = torch.finfo(dtype).min
+    mask_tensor = torch.full(valid_mask.shape, min_dtype, dtype=dtype, device=device)
+    mask_tensor.masked_fill_(valid_mask, 0.0)
+    return mask_tensor
+
+
+def align_padding_mask_length(attention_mask: Optional[torch.Tensor], target_len: int) -> Optional[torch.Tensor]:
+    """Trim or right-pad a 2D padding mask to the requested key length."""
+    if attention_mask is None or attention_mask.ndim != 2:
+        return attention_mask
+    current_len = attention_mask.shape[1]
+    if current_len == target_len:
+        return attention_mask
+    if current_len > target_len:
+        return attention_mask[:, :target_len]
+    pad = torch.zeros(
+        attention_mask.shape[0],
+        target_len - current_len,
+        dtype=attention_mask.dtype,
+        device=attention_mask.device,
+    )
+    return torch.cat([attention_mask, pad], dim=1)
+
+
+def align_cross_attention_mask(
+    attention_mask: Optional[torch.Tensor],
+    query_len: int,
+    key_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Keep cross-attention masks aligned with the actual key/value sequence length."""
+    if attention_mask is None:
+        return None
+    if attention_mask.ndim == 2:
+        return create_cross_attention_4d_mask(
+            query_len=query_len,
+            key_len=key_len,
+            dtype=dtype,
+            device=device,
+            attention_mask=align_padding_mask_length(attention_mask, key_len),
+        )
+    if attention_mask.ndim != 4:
+        return attention_mask
+
+    aligned = attention_mask
+    if aligned.shape[-2] > query_len:
+        aligned = aligned[:, :, :query_len, :]
+    elif aligned.shape[-2] < query_len:
+        q_pad = query_len - aligned.shape[-2]
+        aligned = F.pad(aligned, (0, 0, 0, q_pad), value=0.0)
+
+    if aligned.shape[-1] > key_len:
+        aligned = aligned[:, :, :, :key_len]
+    elif aligned.shape[-1] < key_len:
+        k_pad = key_len - aligned.shape[-1]
+        aligned = F.pad(aligned, (0, k_pad), value=torch.finfo(dtype).min)
+    return aligned
+
+
 def pack_sequences(hidden1: torch.Tensor, hidden2: torch.Tensor, mask1: torch.Tensor, mask2: torch.Tensor):
     """
     Pack two sequences by concatenating and sorting them based on mask values.
@@ -463,6 +536,24 @@ class AceStepDiTLayer(GradientCheckpointingLayer):
         if self.use_cross_attention:
             self.cross_attn_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.cross_attn = AceStepAttention(config=config, layer_idx=layer_idx, is_cross_attention=True)
+            self.timing_cross_attn_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.timing_cross_attn = AceStepAttention(config=config, layer_idx=layer_idx, is_cross_attention=True)
+            self.timing_attn_gate = nn.Parameter(torch.full((1, 1, config.hidden_size), -4.0))
+            self.timing_global_norm = nn.LayerNorm(config.hidden_size)
+            timing_global_bottleneck_dim = int(
+                max(8, getattr(config, "timing_global_bottleneck_dim", 8))
+            )
+            self.timing_global_modulation = nn.Sequential(
+                nn.Linear(config.hidden_size, timing_global_bottleneck_dim, bias=False),
+                nn.SiLU(),
+                nn.Linear(timing_global_bottleneck_dim, 6 * config.hidden_size),
+            )
+            nn.init.normal_(
+                self.timing_global_modulation[0].weight,
+                std=config.initializer_range,
+            )
+            nn.init.zeros_(self.timing_global_modulation[2].weight)
+            nn.init.zeros_(self.timing_global_modulation[2].bias)
 
         # 3. Feed-forward MLP sub-layer with adaptive normalization
         self.mlp_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -485,6 +576,9 @@ class AceStepDiTLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
+        timing_hidden_states: Optional[torch.Tensor] = None,
+        timing_attention_mask: Optional[torch.Tensor] = None,
+        timing_global_state: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -493,6 +587,24 @@ class AceStepDiTLayer(GradientCheckpointingLayer):
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
             self.scale_shift_table + temb
         ).chunk(6, dim=1)
+        if self.use_cross_attention and timing_global_state is not None:
+            timing_global_mod = self.timing_global_modulation(
+                self.timing_global_norm(timing_global_state)
+            ).view(timing_global_state.shape[0], 6, -1)
+            (
+                timing_shift_msa,
+                timing_scale_msa,
+                timing_gate_msa,
+                timing_c_shift_msa,
+                timing_c_scale_msa,
+                timing_c_gate_msa,
+            ) = timing_global_mod.chunk(6, dim=1)
+            shift_msa = shift_msa + timing_shift_msa
+            scale_msa = scale_msa + timing_scale_msa
+            gate_msa = gate_msa + timing_gate_msa
+            c_shift_msa = c_shift_msa + timing_c_shift_msa
+            c_scale_msa = c_scale_msa + timing_c_scale_msa
+            c_gate_msa = c_gate_msa + timing_c_gate_msa
 
         # Step 1: Self-attention with adaptive layer norm (AdaLN)
         # Apply adaptive normalization: norm(x) * (1 + scale) + shift
@@ -524,6 +636,28 @@ class AceStepDiTLayer(GradientCheckpointingLayer):
             )
             # Standard residual connection for cross-attention
             hidden_states = hidden_states + attn_output
+
+            if timing_hidden_states is not None:
+                timing_attention_mask = align_cross_attention_mask(
+                    timing_attention_mask,
+                    query_len=norm_hidden_states.shape[1],
+                    key_len=timing_hidden_states.shape[1],
+                    dtype=norm_hidden_states.dtype,
+                    device=norm_hidden_states.device,
+                )
+                norm_hidden_states = self.timing_cross_attn_norm(hidden_states).type_as(hidden_states)
+                timing_attn_output, _ = self.timing_cross_attn(
+                    hidden_states=norm_hidden_states,
+                    encoder_hidden_states=timing_hidden_states,
+                    attention_mask=timing_attention_mask,
+                    past_key_value=None,
+                    output_attentions=output_attentions,
+                    use_cache=False,
+                    **kwargs,
+                )
+                hidden_states = hidden_states + timing_attn_output * torch.sigmoid(self.timing_attn_gate).to(
+                    timing_attn_output.dtype
+                )
 
         # Step 3: Feed-forward (MLP) with adaptive layer norm
         # Apply adaptive normalization for MLP: norm(x) * (1 + scale) + shift
@@ -1309,6 +1443,9 @@ class AceStepDiTModel(AceStepPreTrainedModel):
         encoder_hidden_states: torch.Tensor,
         encoder_attention_mask: torch.Tensor,
         context_latents: torch.Tensor,
+        timing_hidden_states: Optional[torch.Tensor] = None,
+        timing_attention_mask: Optional[torch.Tensor] = None,
+        timing_global_states: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         past_key_values: Optional[EncoderDecoderCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -1357,6 +1494,15 @@ class AceStepDiTModel(AceStepPreTrainedModel):
         # Project input to patches and project encoder states
         hidden_states = self.proj_in(hidden_states)
         encoder_hidden_states = self.condition_embedder(encoder_hidden_states)
+        if timing_hidden_states is not None:
+            timing_hidden_states = self.condition_embedder(timing_hidden_states)
+            if timing_attention_mask is not None:
+                timing_attention_mask = align_padding_mask_length(
+                    timing_attention_mask,
+                    timing_hidden_states.shape[1],
+                )
+        if timing_global_states is not None:
+            timing_global_states = self.condition_embedder(timing_global_states.unsqueeze(1)).squeeze(1)
         
         # Cache positions
         if cache_position is None:
@@ -1382,6 +1528,7 @@ class AceStepDiTModel(AceStepPreTrainedModel):
         full_attn_mask = None
         sliding_attn_mask = None
         encoder_attention_mask = None
+        timing_cross_attention_mask = None
         attention_mask = None
         if is_flash_attn:
             # -------------------------------------------------------
@@ -1396,6 +1543,7 @@ class AceStepDiTModel(AceStepPreTrainedModel):
             # 这里的逻辑是：如果配置启用了滑动窗口，FA 模式下我们也只需要传基础的 padding mask
             # Layer 会自己决定是否调用带 sliding window 的 kernel
             sliding_attn_mask = attention_mask if self.config.use_sliding_window else None
+            timing_cross_attention_mask = timing_attention_mask
 
         else:
             # -------------------------------------------------------
@@ -1414,18 +1562,22 @@ class AceStepDiTModel(AceStepPreTrainedModel):
                 is_sliding_window=False,
                 is_causal=False                    # <--- 关键：双向注意力
             )
-            max_len = max(seq_len, encoder_seq_len)
-            
-            encoder_attention_mask = create_4d_mask(
-                seq_len=max_len,
+            encoder_attention_mask = create_cross_attention_4d_mask(
+                query_len=seq_len,
+                key_len=encoder_seq_len,
                 dtype=dtype,
                 device=device,
-                attention_mask=attention_mask,     # [B, L]
-                sliding_window=None,
-                is_sliding_window=False,
-                is_causal=False                    # <--- 关键：双向注意力
+                attention_mask=encoder_attention_mask,
             )
-            encoder_attention_mask = encoder_attention_mask[:, :, :seq_len, :encoder_seq_len]
+            if timing_hidden_states is not None and timing_attention_mask is not None:
+                timing_seq_len = timing_hidden_states.shape[1]
+                timing_cross_attention_mask = align_cross_attention_mask(
+                    timing_attention_mask,
+                    query_len=seq_len,
+                    key_len=timing_seq_len,
+                    dtype=dtype,
+                    device=device,
+                )
             # 2. Sliding Attention (Bidirectional, Local)
             # 对应原来的 create_sliding_window... + bidirectional
             if self.config.use_sliding_window:
@@ -1474,6 +1626,9 @@ class AceStepDiTModel(AceStepPreTrainedModel):
                 cache_position,
                 encoder_hidden_states,
                 self_attn_mask_mapping["encoder_attention_mask"],
+                timing_hidden_states,
+                timing_cross_attention_mask,
+                timing_global_states,
                 **flash_attn_kwargs,
             )
             hidden_states = layer_outputs[0]
@@ -1858,6 +2013,10 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
         time_costs["encoder_time_cost"] = end_time - start_time
         start_time = end_time
 
+        timing_hidden_states = kwargs.get("timing_hidden_states")
+        timing_attention_mask = kwargs.get("timing_attention_mask")
+        timing_global_states = kwargs.get("timing_global_states")
+
         # Calculate cover steps based on audio_cover_strength
         cover_steps = int(infer_steps * audio_cover_strength)
         device, dtype = context_latents.device, context_latents.dtype
@@ -1909,6 +2068,11 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
             # src_latents
             context_latents = torch.cat([context_latents, context_latents], dim=0)
             attention_mask = torch.cat([attention_mask, attention_mask], dim=0)
+            if timing_hidden_states is not None and timing_attention_mask is not None:
+                timing_hidden_states = torch.cat([timing_hidden_states, timing_hidden_states], dim=0)
+                timing_attention_mask = torch.cat([timing_attention_mask, timing_attention_mask], dim=0)
+            if timing_global_states is not None:
+                timing_global_states = torch.cat([timing_global_states, timing_global_states], dim=0)
         
         _switched_to_non_cover = False
         with torch.no_grad():
@@ -1935,6 +2099,9 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
                     attention_mask=attention_mask,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
+                    timing_hidden_states=timing_hidden_states,
+                    timing_attention_mask=timing_attention_mask,
+                    timing_global_states=timing_global_states,
                     context_latents=context_latents,
                     use_cache=True,
                     past_key_values=past_key_values,

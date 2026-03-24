@@ -116,6 +116,7 @@ def load_decoder_for_training(
     variant: str = "turbo",
     device: str = "cpu",
     precision: str = "bf16",
+    config_overrides: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Load the full ``AceStepConditionGenerationModel`` for training.
 
@@ -132,10 +133,20 @@ def load_decoder_for_training(
     Returns:
         The loaded ``AceStepConditionGenerationModel`` instance.
     """
-    from transformers import AutoModel
+    from transformers import AutoConfig, AutoModel
 
     model_dir = _resolve_model_dir(checkpoint_dir, variant)
     dtype = _resolve_dtype(precision)
+    config = None
+    if config_overrides:
+        config = AutoConfig.from_pretrained(
+            str(model_dir),
+            trust_remote_code=True,
+        )
+        for key, value in config_overrides.items():
+            if value is not None:
+                setattr(config, key, value)
+        logger.info("[INFO] Applying model config overrides: %s", config_overrides)
 
     logger.info("[INFO] Loading model from %s (variant=%s, dtype=%s)", model_dir, variant, dtype)
     print(f"[INFO] Loading model from {model_dir} (variant={variant}, dtype={dtype})")
@@ -157,6 +168,7 @@ def load_decoder_for_training(
                 trust_remote_code=True,
                 attn_implementation=attn_impl,
                 dtype=dtype,
+                config=config,
             )
             print(f"[OK] Model loaded with attn_implementation={attn_impl}")
             break

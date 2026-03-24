@@ -158,6 +158,11 @@ class AceStepHandler(
         self._lora_adapter_registry = {}  # adapter_name -> explicit scaling targets
         self._lora_active_adapter = None
 
+        # Optional Phase D inference-time timing conditioning.
+        self.inference_timing_hidden_states = None
+        self.inference_timing_attention_mask = None
+        self.inference_timing_global_states = None
+
         # MLX DiT acceleration (macOS Apple Silicon only)
         self.mlx_decoder = None
         self.use_mlx_dit = False
@@ -166,4 +171,3 @@ class AceStepHandler(
         # MLX VAE acceleration (macOS Apple Silicon only)
         self.mlx_vae = None
         self.use_mlx_vae = False
-
