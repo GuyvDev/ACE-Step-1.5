@@ -325,8 +325,46 @@ class TrainingConfigV2(TrainingConfig):
     timing_global_bottleneck_dim: int = 8
     """Bottleneck width for phrase/global decoder modulation (smaller is safer on tiny datasets)."""
 
-    timing_train_last_n_layers: int = 0
+    timing_train_last_n_layers: int = 8
     """Train timing-consumer parameters only in the last N decoder layers (0 = all timing layers)."""
+
+    timing_consumer_adapter_modules: list[str] = field(
+        default_factory=lambda: ["q_proj", "o_proj"]
+    )
+    """Timing cross-attention adapter modules to train for low-data Phase E runs."""
+
+    enable_timing_predictor: bool = False
+    """Enable the Phase E2 timing predictor foundation."""
+
+    timing_condition_source: str = "sidecar"
+    """Timing conditioning source: sidecar, predictor, or hybrid."""
+
+    timing_predictor_loss_weight: float = 1.0
+    """Weight applied to the E2 timing-predictor supervision loss."""
+
+    timing_hybrid_mix: float = 0.5
+    """Hybrid predictor mixing ratio: 0.0 = sidecar only, 1.0 = predictor only."""
+
+    enable_expressivity_supervision: bool = False
+    """Enable Phase E3 expressivity supervision on pooled decoder states and predictor heads."""
+
+    expressivity_loss_weight: float = 0.5
+    """Global weight applied to the E3 expressivity supervision loss."""
+
+    expressivity_f0_weight: float = 0.4
+    """Weight for phrase-aware F0 / landing supervision."""
+
+    expressivity_energy_weight: float = 0.4
+    """Weight for energy / release-envelope supervision."""
+
+    expressivity_terminal_decay_weight: float = 0.5
+    """Weight for phrase-final terminal decay supervision."""
+
+    expressivity_cv_ratio_weight: float = 0.3
+    """Weight for consonant-vowel redistribution supervision."""
+
+    expressivity_release_weight: float = 0.2
+    """Weight for release-class supervision."""
 
     validate_every_n_epochs: int = 1
     """Run validation every N epochs when val_split > 0."""
@@ -339,6 +377,9 @@ class TrainingConfigV2(TrainingConfig):
 
     save_best_checkpoint: bool = True
     """Save a rolling best checkpoint when validation improves."""
+
+    skip_nonfinite_gradients: bool = False
+    """Replace non-finite gradients with zeros before clipping (low-data safety valve)."""
 
     # -----------------------------------------------------------------------
     # Helpers
@@ -424,10 +465,23 @@ class TrainingConfigV2(TrainingConfig):
                 "timing_global_condition_scale": self.timing_global_condition_scale,
                 "timing_global_bottleneck_dim": self.timing_global_bottleneck_dim,
                 "timing_train_last_n_layers": self.timing_train_last_n_layers,
+                "timing_consumer_adapter_modules": self.timing_consumer_adapter_modules,
+                "enable_timing_predictor": self.enable_timing_predictor,
+                "timing_condition_source": self.timing_condition_source,
+                "timing_predictor_loss_weight": self.timing_predictor_loss_weight,
+                "timing_hybrid_mix": self.timing_hybrid_mix,
+                "enable_expressivity_supervision": self.enable_expressivity_supervision,
+                "expressivity_loss_weight": self.expressivity_loss_weight,
+                "expressivity_f0_weight": self.expressivity_f0_weight,
+                "expressivity_energy_weight": self.expressivity_energy_weight,
+                "expressivity_terminal_decay_weight": self.expressivity_terminal_decay_weight,
+                "expressivity_cv_ratio_weight": self.expressivity_cv_ratio_weight,
+                "expressivity_release_weight": self.expressivity_release_weight,
                 "validate_every_n_epochs": self.validate_every_n_epochs,
                 "early_stopping_patience": self.early_stopping_patience,
                 "early_stopping_min_delta": self.early_stopping_min_delta,
                 "save_best_checkpoint": self.save_best_checkpoint,
+                "skip_nonfinite_gradients": self.skip_nonfinite_gradients,
             }
         )
         return base

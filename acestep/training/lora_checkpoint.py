@@ -22,6 +22,106 @@ except ImportError:
     PEFT_AVAILABLE = False
 
 
+def _move_optimizer_state_to_device(state: Dict[str, Any], device: torch.device | None) -> None:
+    """Move optimizer state tensors to the requested device in-place."""
+    if device is None:
+        return
+    for slot in state.values():
+        if not isinstance(slot, dict):
+            continue
+        for key, value in list(slot.items()):
+            if isinstance(value, torch.Tensor):
+                slot[key] = value.to(device)
+
+
+def _load_optimizer_state_best_effort(
+    optimizer,
+    optimizer_state: Dict[str, Any],
+    device: torch.device | None = None,
+) -> tuple[bool, str]:
+    """Load optimizer state even when trainable parameter counts changed.
+
+    This keeps exact behavior for perfect matches, but can salvage optimizer
+    moments for the shared parameter prefix when a later phase adds newly
+    trainable modules (for example Phase C -> Phase D timing modules).
+    """
+    try:
+        if device is not None:
+            _move_optimizer_state_to_device(optimizer_state.get("state", {}), device)
+        optimizer.load_state_dict(optimizer_state)
+        return True, "exact"
+    except (RuntimeError, ValueError, KeyError) as exact_err:
+        current_state = optimizer.state_dict()
+        loaded_groups = optimizer_state.get("param_groups", [])
+        current_groups = current_state.get("param_groups", [])
+        live_groups = optimizer.param_groups
+        if not loaded_groups or not current_groups:
+            raise exact_err
+        if len(loaded_groups) != len(current_groups):
+            raise exact_err
+
+        remapped_state: Dict[str, Any] = {"state": {}, "param_groups": current_groups}
+        restored_params = 0
+        total_old_params = 0
+
+        for loaded_group, current_group, live_group in zip(loaded_groups, current_groups, live_groups):
+            loaded_params = list(loaded_group.get("params", []))
+            current_params = list(current_group.get("params", []))
+            live_params = list(live_group.get("params", []))
+            total_old_params += len(loaded_params)
+            current_idx = 0
+            for old_pid in loaded_params:
+                slot = optimizer_state.get("state", {}).get(old_pid)
+                if slot is None:
+                    continue
+                match_tensor = next(
+                    (
+                        value
+                        for value in slot.values()
+                        if isinstance(value, torch.Tensor) and value.ndim > 0
+                    ),
+                    None,
+                )
+                if match_tensor is None:
+                    continue
+                matched = False
+                while current_idx < len(live_params):
+                    live_param = live_params[current_idx]
+                    current_pid = current_params[current_idx]
+                    current_idx += 1
+                    if tuple(live_param.shape) != tuple(match_tensor.shape):
+                        continue
+                    if not isinstance(live_param, torch.Tensor):
+                        continue
+                    matched = True
+                    break
+                if not matched:
+                    continue
+
+                remapped_slot = {}
+                for key, value in slot.items():
+                    if not isinstance(value, torch.Tensor):
+                        remapped_slot[key] = value
+                        continue
+                    target = value
+                    if key != "step":
+                        target = target.to(
+                            device=live_param.device,
+                            dtype=live_param.dtype if value.is_floating_point() else value.dtype,
+                        )
+                    elif device is not None:
+                        target = target.to(device)
+                    remapped_slot[key] = target
+                remapped_state["state"][current_pid] = remapped_slot
+                restored_params += 1
+
+        if restored_params == 0:
+            raise exact_err
+
+        optimizer.load_state_dict(remapped_state)
+        return True, f"partial({restored_params}/{total_old_params})"
+
+
 def save_lora_weights(
     model: Module,
     output_dir: str,
@@ -217,14 +317,20 @@ def load_training_checkpoint(
             if optimizer is not None and "optimizer_state_dict" in training_state:
                 try:
                     optimizer_state = training_state["optimizer_state_dict"]
-                    if device is not None:
-                        for state in optimizer_state.get("state", {}).values():
-                            for k, v in state.items():
-                                if isinstance(v, torch.Tensor):
-                                    state[k] = v.to(device)
-                    optimizer.load_state_dict(optimizer_state)
+                    loaded, mode = _load_optimizer_state_best_effort(
+                        optimizer,
+                        optimizer_state,
+                        device=device,
+                    )
+                    if not loaded:
+                        raise RuntimeError("optimizer state load returned False")
                     result["loaded_optimizer"] = True
-                    logger.info("Loaded optimizer state from checkpoint")
+                    if mode == "exact":
+                        logger.info("Loaded optimizer state from checkpoint")
+                    else:
+                        logger.info(
+                            f"Loaded optimizer state from checkpoint using {mode} compatibility mapping"
+                        )
                 except (RuntimeError, ValueError, KeyError) as e:
                     logger.warning(f"Failed to load optimizer state: {e}")
 

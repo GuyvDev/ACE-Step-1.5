@@ -211,6 +211,12 @@ def _add_common_training_args(parser: argparse.ArgumentParser) -> None:
     g_train.add_argument("--warmup-steps", type=int, default=100, help="LR warmup steps (default: 100)")
     g_train.add_argument("--weight-decay", type=float, default=0.01, help="AdamW weight decay (default: 0.01)")
     g_train.add_argument("--max-grad-norm", type=float, default=1.0, help="Gradient clipping norm (default: 1.0)")
+    g_train.add_argument(
+        "--skip-nonfinite-gradients",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Replace non-finite gradients with zeros before clipping (safer for tiny experimental runs; default: False)",
+    )
     g_train.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
     g_train.add_argument("--val-split", type=float, default=0.0, help="Fraction of the tensor dataset to reserve for validation (default: 0.0)")
     g_train.add_argument("--shift", type=float, default=3.0, help="Noise schedule shift (turbo=3.0, base/sft=1.0)")
@@ -470,6 +476,79 @@ def _add_fixed_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=0,
         help="Train timing-consumer parameters only in the last N decoder layers (default: 0 = all layers)",
+    )
+    g.add_argument(
+        "--timing-consumer-adapter-modules",
+        nargs="+",
+        default=["q_proj", "o_proj"],
+        help="Timing cross-attention adapter module names to train for Phase E0 (default: q_proj o_proj)",
+    )
+    g.add_argument(
+        "--enable-timing-predictor",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the Phase E2 timing predictor foundation (default: False)",
+    )
+    g.add_argument(
+        "--timing-condition-source",
+        type=str,
+        default="sidecar",
+        choices=["sidecar", "predictor", "hybrid"],
+        help="Timing conditioning source for decoder use (default: sidecar)",
+    )
+    g.add_argument(
+        "--timing-predictor-loss-weight",
+        type=float,
+        default=1.0,
+        help="Auxiliary loss weight for the Phase E2 timing predictor (default: 1.0)",
+    )
+    g.add_argument(
+        "--timing-hybrid-mix",
+        type=float,
+        default=0.5,
+        help="Hybrid predictor mix: 0.0 = sidecar only, 1.0 = predictor only (default: 0.5)",
+    )
+    g.add_argument(
+        "--enable-expressivity-supervision",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable Phase E3 expressivity supervision (default: False)",
+    )
+    g.add_argument(
+        "--expressivity-loss-weight",
+        type=float,
+        default=0.5,
+        help="Global Phase E3 expressivity loss weight (default: 0.5)",
+    )
+    g.add_argument(
+        "--expressivity-f0-weight",
+        type=float,
+        default=0.4,
+        help="Weight for expressive F0 supervision (default: 0.4)",
+    )
+    g.add_argument(
+        "--expressivity-energy-weight",
+        type=float,
+        default=0.4,
+        help="Weight for energy / release-envelope supervision (default: 0.4)",
+    )
+    g.add_argument(
+        "--expressivity-terminal-decay-weight",
+        type=float,
+        default=0.5,
+        help="Weight for phrase-final terminal decay supervision (default: 0.5)",
+    )
+    g.add_argument(
+        "--expressivity-cv-ratio-weight",
+        type=float,
+        default=0.3,
+        help="Weight for consonant-vowel redistribution supervision (default: 0.3)",
+    )
+    g.add_argument(
+        "--expressivity-release-weight",
+        type=float,
+        default=0.2,
+        help="Weight for release-class supervision (default: 0.2)",
     )
 
 

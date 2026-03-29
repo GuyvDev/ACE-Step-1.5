@@ -83,6 +83,70 @@ def _resolve_requested_fabric_precision(precision: str, device_type: str) -> str
     return mapping.get(precision, _select_fabric_precision(device_type))
 
 
+def _sanitize_nonfinite_gradients(
+    model: nn.Module,
+    *,
+    max_names: int = 12,
+) -> tuple[int, list[str]]:
+    """Replace non-finite gradients with zeros and return a short report."""
+    fixed = 0
+    names: list[str] = []
+    for name, param in model.named_parameters():
+        grad = param.grad
+        if grad is None or torch.isfinite(grad).all():
+            continue
+        param.grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+        fixed += 1
+        if len(names) < max_names:
+            names.append(name)
+    return fixed, names
+
+
+def _sanitize_nonfinite_parameters(
+    model: nn.Module,
+    *,
+    max_names: int = 12,
+) -> tuple[int, list[str]]:
+    """Replace non-finite parameter values with finite fallbacks."""
+    fixed = 0
+    names: list[str] = []
+    for name, param in model.named_parameters():
+        if torch.isfinite(param).all():
+            continue
+        with torch.no_grad():
+            param.copy_(torch.nan_to_num(param, nan=0.0, posinf=0.0, neginf=0.0))
+        fixed += 1
+        if len(names) < max_names:
+            names.append(name)
+    return fixed, names
+
+
+def _summarize_batch_metadata(batch: Dict[str, Any], *, max_items: int = 3) -> str:
+    """Build a short, human-readable identifier for the current batch."""
+    metadata = batch.get("metadata")
+    if not isinstance(metadata, list):
+        return "<unknown>"
+
+    labels: list[str] = []
+    for item in metadata[:max_items]:
+        if not isinstance(item, dict):
+            continue
+        label = (
+            item.get("item_name")
+            or item.get("audio_path")
+            or item.get("source_path")
+            or item.get("file_name")
+        )
+        if label:
+            labels.append(str(label))
+
+    if not labels:
+        return "<unknown>"
+    if len(metadata) > max_items:
+        labels.append("...")
+    return ", ".join(labels)
+
+
 # ===========================================================================
 # FixedLoRATrainer -- orchestration
 # ===========================================================================
@@ -407,6 +471,24 @@ class FixedLoRATrainer:
                     return
 
                 loss = self.module.training_step(batch)
+                if not torch.isfinite(loss):
+                    batch_desc = _summarize_batch_metadata(batch)
+                    if getattr(cfg, "skip_nonfinite_gradients", False):
+                        logger.warning(
+                            "[Side-Step] Skipping non-finite training loss at epoch %d batch %d: %s",
+                            epoch + 1,
+                            _batch_idx,
+                            batch_desc,
+                        )
+                        optimizer.zero_grad(set_to_none=True)
+                        accumulated_loss = 0.0
+                        accumulation_step = 0
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
+                    raise RuntimeError(
+                        f"Non-finite training loss at epoch {epoch + 1} batch {_batch_idx}: {batch_desc}"
+                    )
                 loss = loss / cfg.gradient_accumulation_steps
                 self.fabric.backward(loss)
                 accumulated_loss += loss.item()
@@ -414,10 +496,37 @@ class FixedLoRATrainer:
                 accumulation_step += 1
 
                 if accumulation_step >= cfg.gradient_accumulation_steps:
-                    self.fabric.clip_gradients(
-                        self.module.model.decoder, optimizer, max_norm=cfg.max_grad_norm,
-                    )
+                    if getattr(cfg, "skip_nonfinite_gradients", False):
+                        fixed_count, fixed_names = _sanitize_nonfinite_gradients(
+                            self.module
+                        )
+                        if fixed_count:
+                            logger.warning(
+                                "[Side-Step] Replaced non-finite gradients in %d trainable params before clipping: %s",
+                                fixed_count,
+                                ", ".join(fixed_names),
+                            )
+                    if getattr(cfg, "skip_nonfinite_gradients", False):
+                        torch.nn.utils.clip_grad_norm_(
+                            trainable_params,
+                            cfg.max_grad_norm,
+                            error_if_nonfinite=False,
+                        )
+                    else:
+                        self.fabric.clip_gradients(
+                            self.module.model.decoder, optimizer, max_norm=cfg.max_grad_norm,
+                        )
                     optimizer.step()
+                    if getattr(cfg, "skip_nonfinite_gradients", False):
+                        fixed_param_count, fixed_param_names = _sanitize_nonfinite_parameters(
+                            self.module
+                        )
+                        if fixed_param_count:
+                            logger.warning(
+                                "[Side-Step] Replaced non-finite parameter values in %d params after optimizer step: %s",
+                                fixed_param_count,
+                                ", ".join(fixed_param_names),
+                            )
                     scheduler.step()
                     global_step += 1
 
@@ -449,10 +558,37 @@ class FixedLoRATrainer:
 
             # Flush remainder
             if accumulation_step > 0:
-                self.fabric.clip_gradients(
-                    self.module.model.decoder, optimizer, max_norm=cfg.max_grad_norm,
-                )
+                if getattr(cfg, "skip_nonfinite_gradients", False):
+                    fixed_count, fixed_names = _sanitize_nonfinite_gradients(
+                        self.module
+                    )
+                    if fixed_count:
+                        logger.warning(
+                            "[Side-Step] Replaced non-finite gradients in %d trainable params before clipping: %s",
+                            fixed_count,
+                            ", ".join(fixed_names),
+                        )
+                if getattr(cfg, "skip_nonfinite_gradients", False):
+                    torch.nn.utils.clip_grad_norm_(
+                        trainable_params,
+                        cfg.max_grad_norm,
+                        error_if_nonfinite=False,
+                    )
+                else:
+                    self.fabric.clip_gradients(
+                        self.module.model.decoder, optimizer, max_norm=cfg.max_grad_norm,
+                    )
                 optimizer.step()
+                if getattr(cfg, "skip_nonfinite_gradients", False):
+                    fixed_param_count, fixed_param_names = _sanitize_nonfinite_parameters(
+                        self.module
+                    )
+                    if fixed_param_count:
+                        logger.warning(
+                            "[Side-Step] Replaced non-finite parameter values in %d params after optimizer step: %s",
+                            fixed_param_count,
+                            ", ".join(fixed_param_names),
+                        )
                 scheduler.step()
                 global_step += 1
 
@@ -491,11 +627,26 @@ class FixedLoRATrainer:
                 with torch.no_grad():
                     for val_batch in val_loader:
                         v_loss = self.module.training_step(val_batch, record_loss=False)
+                        if not torch.isfinite(v_loss):
+                            batch_desc = _summarize_batch_metadata(val_batch)
+                            logger.warning(
+                                "[Side-Step] Skipping non-finite validation loss at epoch %d: %s",
+                                epoch + 1,
+                                batch_desc,
+                            )
+                            continue
                         total_val_loss += float(v_loss.item())
                         n_val += 1
                 self.module.model.decoder.train()
 
-                val_loss = total_val_loss / max(n_val, 1)
+                if n_val == 0:
+                    val_loss = float("inf")
+                    logger.warning(
+                        "[Side-Step] All validation batches were non-finite at epoch %d",
+                        epoch + 1,
+                    )
+                else:
+                    val_loss = total_val_loss / n_val
                 tb.log_scalar("val/loss", val_loss, epoch + 1)
                 yield TrainingUpdate(
                     step=global_step,

@@ -75,6 +75,66 @@ def _load_decoder_timing_state(module: Any, decoder_state: dict[str, torch.Tenso
         return False
 
 
+def _load_module_state_shape_compatible(
+    target_module: nn.Module,
+    source_state: dict[str, torch.Tensor],
+    source: Path,
+    label: str,
+) -> bool:
+    """Load every compatible tensor from ``source_state`` into ``target_module``.
+
+    This is used for checkpoint continuation across nearby schema revisions where
+    the module mostly matches but a few keys changed shape or were newly added.
+    """
+    target_state = target_module.state_dict()
+    compatible_state: dict[str, torch.Tensor] = {}
+    copied_pos_emb = False
+    skipped: list[str] = []
+
+    for key, value in source_state.items():
+        target_value = target_state.get(key)
+        if target_value is None:
+            skipped.append(key)
+            continue
+        if target_value.shape == value.shape:
+            compatible_state[key] = value
+            continue
+        if (
+            key == "pos_emb.weight"
+            and value.ndim == 2
+            and target_value.ndim == 2
+            and value.shape[1] == target_value.shape[1]
+        ):
+            patched = target_value.detach().clone()
+            rows = min(int(value.shape[0]), int(target_value.shape[0]))
+            patched[:rows] = value[:rows].to(dtype=patched.dtype)
+            compatible_state[key] = patched
+            copied_pos_emb = True
+            continue
+        skipped.append(key)
+
+    missing, unexpected = target_module.load_state_dict(compatible_state, strict=False)
+    logger.info(
+        "[OK] Loaded %s shape-compatibly from %s (%d tensors, skipped=%d, missing=%d, unexpected=%d, partial_pos_emb=%s)",
+        label,
+        source,
+        len(compatible_state),
+        len(skipped),
+        len(missing),
+        len(unexpected),
+        copied_pos_emb,
+    )
+    if skipped:
+        logger.warning(
+            "[WARN] Skipped %d incompatible %s tensors from %s: %s",
+            len(skipped),
+            label,
+            source,
+            ", ".join(skipped[:12]) + (" ..." if len(skipped) > 12 else ""),
+        )
+    return bool(compatible_state)
+
+
 def _save_bridge_module(module: Any, output_dir: str) -> None:
     voice_conditioner = getattr(module, "voice_conditioner", None)
     if voice_conditioner is None:
@@ -103,8 +163,16 @@ def _save_timing_module(module: Any, output_dir: str) -> None:
     """Save timing encoder weights alongside LoRA adapter weights."""
     timing_encoder = getattr(module, "timing_encoder", None)
     decoder_timing_supervisor = getattr(module, "decoder_timing_supervisor", None)
+    timing_predictor = getattr(module, "performance_timing_predictor", None)
+    decoder_expressivity_supervisor = getattr(module, "decoder_expressivity_supervisor", None)
     decoder_timing_state = _collect_decoder_timing_state(module)
-    if timing_encoder is None and decoder_timing_supervisor is None and not decoder_timing_state:
+    if (
+        timing_encoder is None
+        and decoder_timing_supervisor is None
+        and timing_predictor is None
+        and decoder_expressivity_supervisor is None
+        and not decoder_timing_state
+    ):
         return
     timing_path = os.path.join(output_dir, "timing_branch.pt")
     payload = {}
@@ -113,6 +181,11 @@ def _save_timing_module(module: Any, output_dir: str) -> None:
         payload["config"] = timing_encoder.export_config()
     if decoder_timing_supervisor is not None:
         payload["decoder_state_dict"] = decoder_timing_supervisor.state_dict()
+    if timing_predictor is not None:
+        payload["predictor_state_dict"] = timing_predictor.state_dict()
+        payload["predictor_config"] = timing_predictor.export_config()
+    if decoder_expressivity_supervisor is not None:
+        payload["expressivity_state_dict"] = decoder_expressivity_supervisor.state_dict()
     if decoder_timing_state:
         payload["decoder_model_state_dict"] = decoder_timing_state
     torch.save(payload, timing_path)
@@ -123,8 +196,15 @@ def _load_timing_module(module: Any, checkpoint_dir: Path) -> bool:
     """Load timing encoder weights from a checkpoint directory."""
     timing_encoder = getattr(module, "timing_encoder", None)
     decoder_timing_supervisor = getattr(module, "decoder_timing_supervisor", None)
+    timing_predictor = getattr(module, "performance_timing_predictor", None)
+    decoder_expressivity_supervisor = getattr(module, "decoder_expressivity_supervisor", None)
     timing_path = checkpoint_dir / "timing_branch.pt"
-    if (timing_encoder is None and decoder_timing_supervisor is None) or not timing_path.exists():
+    if (
+        timing_encoder is None
+        and decoder_timing_supervisor is None
+        and timing_predictor is None
+        and decoder_expressivity_supervisor is None
+    ) or not timing_path.exists():
         return False
     try:
         payload = load_saved_timing_module(str(timing_path), map_location=module.device)
@@ -134,24 +214,64 @@ def _load_timing_module(module: Any, checkpoint_dir: Path) -> bool:
                 logger.info("[OK] Loaded timing branch weights from %s", timing_path)
             except Exception as strict_err:
                 logger.warning(
-                    "[WARN] Strict timing-branch load failed for %s: %s; retrying non-strict",
+                    "[WARN] Strict timing-branch load failed for %s: %s; retrying shape-compatible load",
                     timing_path,
                     strict_err,
                 )
-                timing_encoder.load_state_dict(payload["state_dict"], strict=False)
-                logger.info("[OK] Loaded timing branch weights non-strictly from %s", timing_path)
+                _load_module_state_shape_compatible(
+                    timing_encoder,
+                    payload["state_dict"],
+                    timing_path,
+                    "timing branch",
+                )
         if decoder_timing_supervisor is not None and "decoder_state_dict" in payload:
             try:
                 decoder_timing_supervisor.load_state_dict(payload["decoder_state_dict"], strict=True)
                 logger.info("[OK] Loaded decoder timing supervisor from %s", timing_path)
             except Exception as strict_err:
                 logger.warning(
-                    "[WARN] Strict decoder timing-supervisor load failed for %s: %s; retrying non-strict",
+                    "[WARN] Strict decoder timing-supervisor load failed for %s: %s; retrying shape-compatible load",
                     timing_path,
                     strict_err,
                 )
-                decoder_timing_supervisor.load_state_dict(payload["decoder_state_dict"], strict=False)
-                logger.info("[OK] Loaded decoder timing supervisor non-strictly from %s", timing_path)
+                _load_module_state_shape_compatible(
+                    decoder_timing_supervisor,
+                    payload["decoder_state_dict"],
+                    timing_path,
+                    "decoder timing supervisor",
+                )
+        if timing_predictor is not None and "predictor_state_dict" in payload:
+            try:
+                timing_predictor.load_state_dict(payload["predictor_state_dict"], strict=True)
+                logger.info("[OK] Loaded timing predictor from %s", timing_path)
+            except Exception as strict_err:
+                logger.warning(
+                    "[WARN] Strict timing-predictor load failed for %s: %s; retrying shape-compatible load",
+                    timing_path,
+                    strict_err,
+                )
+                _load_module_state_shape_compatible(
+                    timing_predictor,
+                    payload["predictor_state_dict"],
+                    timing_path,
+                    "timing predictor",
+                )
+        if decoder_expressivity_supervisor is not None and "expressivity_state_dict" in payload:
+            try:
+                decoder_expressivity_supervisor.load_state_dict(payload["expressivity_state_dict"], strict=True)
+                logger.info("[OK] Loaded decoder expressivity supervisor from %s", timing_path)
+            except Exception as strict_err:
+                logger.warning(
+                    "[WARN] Strict expressivity-supervisor load failed for %s: %s; retrying shape-compatible load",
+                    timing_path,
+                    strict_err,
+                )
+                _load_module_state_shape_compatible(
+                    decoder_expressivity_supervisor,
+                    payload["expressivity_state_dict"],
+                    timing_path,
+                    "decoder expressivity supervisor",
+                )
         if "decoder_model_state_dict" in payload:
             _load_decoder_timing_state(module, payload["decoder_model_state_dict"], timing_path)
         return True

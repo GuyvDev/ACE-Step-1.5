@@ -32,6 +32,11 @@ from acestep.training.lokr_utils import (
 # V2 modules
 from acestep.training_v2.configs import LoRAConfigV2, LoKRConfigV2, TrainingConfigV2
 from acestep.training_v2.mert_conditioning import PrecomputedMERTConditioner
+from acestep.training_v2.performance_timing_predictor import (
+    PerformanceTimingPredictor,
+    PerformanceTimingPredictorConfig,
+)
+from acestep.training_v2.release_targets import DecoderExpressivitySupervisor
 from acestep.training_v2.timestep_sampling import apply_cfg_dropout, sample_timesteps
 from acestep.training_v2.timing_conditioning import (
     DecoderTimingSupervisor,
@@ -265,9 +270,60 @@ class FixedLoRAModule(nn.Module):
         self._timing_train_last_n_layers = max(
             0, int(getattr(training_config, "timing_train_last_n_layers", 0))
         )
+        self._enable_timing_predictor = bool(
+            getattr(training_config, "enable_timing_predictor", False)
+        )
+        self._timing_condition_source = str(
+            getattr(training_config, "timing_condition_source", "sidecar")
+        ).strip().lower()
+        if self._timing_condition_source not in {"sidecar", "predictor", "hybrid"}:
+            self._timing_condition_source = "sidecar"
+        self._timing_predictor_loss_weight = max(
+            0.0, float(getattr(training_config, "timing_predictor_loss_weight", 1.0))
+        )
+        self._timing_hybrid_mix = float(getattr(training_config, "timing_hybrid_mix", 0.5))
+        self._timing_hybrid_mix = max(0.0, min(1.0, self._timing_hybrid_mix))
+        self._enable_expressivity_supervision = bool(
+            getattr(training_config, "enable_expressivity_supervision", False)
+        )
+        self._expressivity_loss_weight = max(
+            0.0, float(getattr(training_config, "expressivity_loss_weight", 0.5))
+        )
+        self._expressivity_f0_weight = float(getattr(training_config, "expressivity_f0_weight", 0.4))
+        self._expressivity_energy_weight = float(getattr(training_config, "expressivity_energy_weight", 0.4))
+        self._expressivity_terminal_decay_weight = float(
+            getattr(training_config, "expressivity_terminal_decay_weight", 0.5)
+        )
+        self._expressivity_cv_ratio_weight = float(
+            getattr(training_config, "expressivity_cv_ratio_weight", 0.3)
+        )
+        self._expressivity_release_weight = float(
+            getattr(training_config, "expressivity_release_weight", 0.2)
+        )
+        if not self._enable_timing_predictor and self._timing_condition_source != "sidecar":
+            logger.warning(
+                "[WARN] timing_condition_source=%s requested without enable_timing_predictor; falling back to sidecar",
+                self._timing_condition_source,
+            )
+            self._timing_condition_source = "sidecar"
+        raw_consumer_modules = getattr(
+            training_config,
+            "timing_consumer_adapter_modules",
+            ["q_proj", "o_proj"],
+        )
+        if isinstance(raw_consumer_modules, str):
+            raw_consumer_modules = [
+                part.strip() for part in raw_consumer_modules.split(",") if part.strip()
+            ]
+        self._timing_consumer_adapter_modules = tuple(raw_consumer_modules) or (
+            "q_proj",
+            "o_proj",
+        )
 
         self.timing_encoder: TimingEncoder | None = None
         self.decoder_timing_supervisor: DecoderTimingSupervisor | None = None
+        self.performance_timing_predictor: PerformanceTimingPredictor | None = None
+        self.decoder_expressivity_supervisor: DecoderExpressivitySupervisor | None = None
         if self._use_timing_branch:
             dit_dim = int(getattr(model.config, "hidden_size", 2048))
             timing_output_dim = int(getattr(training_config, "timing_output_dim", 0)) or dit_dim
@@ -301,6 +357,33 @@ class FixedLoRAModule(nn.Module):
                 timing_output_dim,
                 decoder_state_dim,
             )
+            if self._enable_timing_predictor:
+                predictor_cfg = PerformanceTimingPredictorConfig(
+                    hidden_size=timing_cfg.hidden_size,
+                    num_heads=timing_cfg.num_heads,
+                    num_layers=timing_cfg.num_layers,
+                    output_dim=timing_output_dim,
+                    dropout=timing_cfg.dropout,
+                    condition_scale=float(getattr(training_config, "timing_condition_scale", 1.0)),
+                    enable_global_condition=self._enable_phrase_modulation,
+                )
+                self.performance_timing_predictor = PerformanceTimingPredictor(predictor_cfg).to(self.device)
+                logger.info(
+                    "[OK] Timing predictor enabled: source=%s, loss_weight=%.3f, hybrid_mix=%.3f",
+                    self._timing_condition_source,
+                    self._timing_predictor_loss_weight,
+                    self._timing_hybrid_mix,
+                )
+            if self._enable_expressivity_supervision:
+                self.decoder_expressivity_supervisor = DecoderExpressivitySupervisor(
+                    input_dim=decoder_state_dim,
+                    hidden_size=timing_cfg.hidden_size,
+                    dropout=float(getattr(training_config, "timing_dropout", 0.1)),
+                ).to(self.device)
+                logger.info(
+                    "[OK] Expressivity supervision enabled: loss_weight=%.3f",
+                    self._expressivity_loss_weight,
+                )
             bootstrapped_layers = self._bootstrap_decoder_timing_parameters()
             logger.info(
                 "[OK] Decoder timing-attention bootstrapped from text cross-attn for %d layers",
@@ -394,8 +477,15 @@ class FixedLoRAModule(nn.Module):
                 continue
             should_train = name.endswith("timing_attn_gate")
             if self._enable_timing_consumer_training:
-                is_timing_adapter = ".timing_cross_attn." in name and (
-                    "lora_" in name or "lokr_" in name or "hada_" in name
+                is_timing_adapter = (
+                    ".timing_cross_attn." in name
+                    and (
+                        "lora_" in name or "lokr_" in name or "hada_" in name
+                    )
+                    and any(
+                        f".{module_name}." in name
+                        for module_name in self._timing_consumer_adapter_modules
+                    )
                 )
                 should_train = (
                     should_train
@@ -575,19 +665,37 @@ class FixedLoRAModule(nn.Module):
             timing_tokens = batch.get("timing_tokens")
             timing_mask = batch.get("timing_mask")
             timing_targets = batch.get("timing_targets")
+            predictor_inputs = batch.get("predictor_inputs")
+            predictor_mask = batch.get("predictor_mask")
             phrase_features = batch.get("phrase_features")
             global_phrase_features = batch.get("global_phrase_features")
+            phrase_ids = batch.get("phrase_ids")
+            f0_targets = batch.get("f0_targets")
+            energy_targets = batch.get("energy_targets")
+            terminal_decay = batch.get("terminal_decay")
+            cv_ratio_targets = batch.get("cv_ratio_targets")
+            alignment_confidence = batch.get("alignment_confidence")
+            beat_confidence = batch.get("beat_confidence")
+            release_targets = batch.get("release_targets")
             timing_event_starts = batch.get("timing_event_starts")
             timing_event_ends = batch.get("timing_event_ends")
             timing_audio_durations = batch.get("timing_audio_duration")
             drop_timing = False
+            timing_loss = torch.tensor(0.0, device=self.device)
+            predictor_loss = torch.tensor(0.0, device=self.device)
+            expressivity_loss = torch.tensor(0.0, device=self.device)
             if (
                 self.timing_encoder is not None
-                and timing_tokens is not None
+                and (timing_tokens is not None or predictor_inputs is not None)
             ):
-                timing_tokens = timing_tokens.to(self.device, non_blocking=nb)
+                if timing_tokens is not None:
+                    timing_tokens = timing_tokens.to(self.device, non_blocking=nb)
                 if timing_mask is not None:
                     timing_mask = timing_mask.to(self.device, non_blocking=nb)
+                if predictor_inputs is not None:
+                    predictor_inputs = predictor_inputs.to(self.device, non_blocking=nb)
+                if predictor_mask is not None:
+                    predictor_mask = predictor_mask.to(self.device, non_blocking=nb)
                 if timing_targets is not None:
                     timing_targets = timing_targets.to(
                         self.device, dtype=torch.float32, non_blocking=nb
@@ -599,6 +707,30 @@ class FixedLoRAModule(nn.Module):
                 if global_phrase_features is not None:
                     global_phrase_features = global_phrase_features.to(
                         self.device, dtype=torch.float32, non_blocking=nb
+                    )
+                if phrase_ids is not None:
+                    phrase_ids = phrase_ids.to(
+                        self.device, dtype=torch.long, non_blocking=nb
+                    )
+                if f0_targets is not None:
+                    f0_targets = f0_targets.to(self.device, dtype=torch.float32, non_blocking=nb)
+                if energy_targets is not None:
+                    energy_targets = energy_targets.to(self.device, dtype=torch.float32, non_blocking=nb)
+                if terminal_decay is not None:
+                    terminal_decay = terminal_decay.to(self.device, dtype=torch.float32, non_blocking=nb)
+                if cv_ratio_targets is not None:
+                    cv_ratio_targets = cv_ratio_targets.to(self.device, dtype=torch.float32, non_blocking=nb)
+                if alignment_confidence is not None:
+                    alignment_confidence = alignment_confidence.to(
+                        self.device, dtype=torch.float32, non_blocking=nb
+                    )
+                if beat_confidence is not None:
+                    beat_confidence = beat_confidence.to(
+                        self.device, dtype=torch.float32, non_blocking=nb
+                    )
+                if release_targets is not None:
+                    release_targets = release_targets.to(
+                        self.device, dtype=torch.long, non_blocking=nb
                     )
                 if timing_event_starts is not None:
                     timing_event_starts = timing_event_starts.to(
@@ -612,6 +744,7 @@ class FixedLoRAModule(nn.Module):
                     timing_audio_durations = timing_audio_durations.to(
                         self.device, dtype=torch.float32, non_blocking=nb
                     )
+                predictor_condition_mask = predictor_mask if predictor_mask is not None else timing_mask
 
                 # Apply conditioning dropout (for robustness without timing)
                 drop_timing = (
@@ -619,25 +752,94 @@ class FixedLoRAModule(nn.Module):
                     and torch.rand(1).item() < self._timing_condition_dropout
                 )
                 if not drop_timing:
-                    timing_out = self.timing_encoder(
-                        timing_tokens=timing_tokens,
-                        timing_mask=timing_mask,
-                        timing_targets=timing_targets,
-                        phrase_features=phrase_features,
-                        global_features=global_phrase_features,
-                        dur_weight=self._timing_dur_weight,
-                        onset_weight=self._timing_onset_weight,
-                        pause_weight=self._timing_pause_weight,
-                        phrase_weight=self._timing_phrase_weight,
-                        tempo_weight=self._timing_tempo_weight,
-                        terminal_weight=self._timing_terminal_weight,
-                    )
-                    timing_loss = timing_out["timing_loss"]
-                    timing_hidden_states = timing_out["projected"].to(self.dtype)
-                    timing_attention_mask = timing_out["attn_mask"].to(encoder_attention_mask.dtype)
-                    timing_global_states = timing_out["global_condition"]
-                    if timing_global_states is not None:
-                        timing_global_states = timing_global_states.to(self.dtype)
+                    timing_out = None
+                    predictor_out = None
+                    if self._timing_condition_source in {"sidecar", "hybrid"} and timing_tokens is not None:
+                        timing_out = self.timing_encoder(
+                            timing_tokens=timing_tokens,
+                            timing_mask=timing_mask,
+                            timing_targets=timing_targets,
+                            phrase_features=phrase_features,
+                            global_features=global_phrase_features,
+                            dur_weight=self._timing_dur_weight,
+                            onset_weight=self._timing_onset_weight,
+                            pause_weight=self._timing_pause_weight,
+                            phrase_weight=self._timing_phrase_weight,
+                            tempo_weight=self._timing_tempo_weight,
+                            terminal_weight=self._timing_terminal_weight,
+                        )
+                        timing_loss = timing_out["timing_loss"]
+                    if self.performance_timing_predictor is not None:
+                        predictor_out = self.performance_timing_predictor(
+                            predictor_inputs=predictor_inputs,
+                            timing_tokens=timing_tokens,
+                            timing_mask=predictor_condition_mask,
+                            timing_targets=timing_targets,
+                            phrase_features=phrase_features,
+                            global_features=global_phrase_features,
+                            phrase_ids=phrase_ids,
+                            f0_targets=f0_targets,
+                            energy_targets=energy_targets,
+                            terminal_decay=terminal_decay,
+                            cv_ratio_targets=cv_ratio_targets,
+                            release_targets=release_targets,
+                            alignment_confidence=alignment_confidence,
+                            beat_confidence=beat_confidence,
+                            dur_weight=self._timing_dur_weight,
+                            onset_weight=self._timing_onset_weight,
+                            pause_weight=self._timing_pause_weight,
+                            phrase_weight=self._timing_phrase_weight,
+                            tempo_weight=self._timing_tempo_weight,
+                            terminal_weight=self._timing_terminal_weight,
+                            expressivity_f0_weight=self._expressivity_f0_weight,
+                            expressivity_energy_weight=self._expressivity_energy_weight,
+                            expressivity_terminal_decay_weight=self._expressivity_terminal_decay_weight,
+                            expressivity_cv_ratio_weight=self._expressivity_cv_ratio_weight,
+                            expressivity_release_weight=self._expressivity_release_weight,
+                        )
+                        predictor_loss = predictor_out["predictor_loss"]
+                        expressivity_loss = predictor_out.get("expressivity_loss", expressivity_loss)
+
+                    selected = timing_out
+                    if self._timing_condition_source == "predictor" and predictor_out is not None:
+                        selected = predictor_out
+                    elif (
+                        self._timing_condition_source == "hybrid"
+                        and timing_out is not None
+                        and predictor_out is not None
+                    ):
+                        mix = self._timing_hybrid_mix
+                        hybrid_global = None
+                        if (
+                            timing_out.get("global_condition") is not None
+                            and predictor_out.get("global_condition") is not None
+                        ):
+                            hybrid_global = (
+                                (1.0 - mix) * timing_out["global_condition"]
+                                + mix * predictor_out["global_condition"]
+                            )
+                        elif predictor_out.get("global_condition") is not None:
+                            hybrid_global = predictor_out["global_condition"]
+                        else:
+                            hybrid_global = timing_out.get("global_condition")
+                        selected = {
+                            "projected": (1.0 - mix) * timing_out["projected"] + mix * predictor_out["projected"],
+                            "attn_mask": timing_out["attn_mask"],
+                            "global_condition": hybrid_global,
+                        }
+                    elif selected is None:
+                        selected = predictor_out
+
+                    if selected is not None:
+                        timing_hidden_states = selected["projected"].to(self.dtype)
+                        timing_attention_mask = selected["attn_mask"].to(encoder_attention_mask.dtype)
+                        timing_global_states = selected.get("global_condition")
+                        if timing_global_states is not None:
+                            timing_global_states = timing_global_states.to(self.dtype)
+                    else:
+                        timing_hidden_states = None
+                        timing_attention_mask = None
+                        timing_global_states = None
                 else:
                     timing_hidden_states = None
                     timing_attention_mask = None
@@ -714,6 +916,26 @@ class FixedLoRAModule(nn.Module):
                     tempo_weight=self._timing_tempo_weight,
                     terminal_weight=self._timing_terminal_weight,
                 )
+                if (
+                    self.decoder_expressivity_supervisor is not None
+                    and self._expressivity_loss_weight > 0.0
+                ):
+                    expressivity_loss = expressivity_loss + self.decoder_expressivity_supervisor(
+                        decoder_event_states=pooled_decoder_states.float(),
+                        f0_targets=f0_targets,
+                        energy_targets=energy_targets,
+                        terminal_decay=terminal_decay,
+                        cv_ratio_targets=cv_ratio_targets,
+                        release_targets=release_targets,
+                        alignment_confidence=alignment_confidence,
+                        beat_confidence=beat_confidence,
+                        timing_mask=timing_mask,
+                        f0_weight=self._expressivity_f0_weight,
+                        energy_weight=self._expressivity_energy_weight,
+                        terminal_weight=self._expressivity_terminal_decay_weight,
+                        cv_ratio_weight=self._expressivity_cv_ratio_weight,
+                        release_weight=self._expressivity_release_weight,
+                    )
 
             # ---- Optional pitch-aware auxiliaries --------------------------
             total_loss = diffusion_loss
@@ -721,8 +943,16 @@ class FixedLoRAModule(nn.Module):
             # Timing branch auxiliary loss (Phase D)
             if self._use_timing_branch and self._timing_loss_weight > 0.0:
                 total_loss = total_loss + self._timing_loss_weight * timing_loss
+            if (
+                self._use_timing_branch
+                and self.performance_timing_predictor is not None
+                and self._timing_predictor_loss_weight > 0.0
+            ):
+                total_loss = total_loss + self._timing_predictor_loss_weight * predictor_loss
             if self._use_timing_branch and self._timing_decoder_loss_weight > 0.0:
                 total_loss = total_loss + self._timing_decoder_loss_weight * decoder_timing_loss
+            if self._use_timing_branch and self._expressivity_loss_weight > 0.0:
+                total_loss = total_loss + self._expressivity_loss_weight * expressivity_loss
 
             if self._f0_loss_weight > 0.0:
                 pred_contour = _latent_f0_proxy_contour(decoder_outputs[0])

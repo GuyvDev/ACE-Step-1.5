@@ -540,6 +540,8 @@ class AceStepDiTLayer(GradientCheckpointingLayer):
             self.timing_cross_attn = AceStepAttention(config=config, layer_idx=layer_idx, is_cross_attention=True)
             self.timing_attn_gate = nn.Parameter(torch.full((1, 1, config.hidden_size), -4.0))
             self.timing_global_norm = nn.LayerNorm(config.hidden_size)
+            nn.init.ones_(self.timing_global_norm.weight)
+            nn.init.zeros_(self.timing_global_norm.bias)
             timing_global_bottleneck_dim = int(
                 max(8, getattr(config, "timing_global_bottleneck_dim", 8))
             )
@@ -704,6 +706,10 @@ class AceStepPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.weight.data.fill_(1.0)
+            if module.bias is not None:
+                module.bias.data.zero_()
         elif isinstance(module, Qwen3RMSNorm):
             module.weight.data.fill_(1.0)
 

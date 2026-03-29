@@ -374,7 +374,7 @@ class TimingEncoderConfig:
     ff_ratio: int = 4
     dropout: float = 0.1
     output_dim: int = 2048
-    max_seq_len: int = 1024
+    max_seq_len: int = 2048
     use_stream_type_embedding: bool = True
     condition_scale: float = 1.0
     phrase_feature_names: list[str] = field(default_factory=lambda: list(PHRASE_FEATURE_NAMES))
@@ -452,6 +452,11 @@ class TimingEncoder(nn.Module):
             if config.enable_phrase_features and config.phrase_feature_dim > 0
             else None
         )
+        self.phrase_gate = (
+            nn.Parameter(torch.tensor(-4.0))
+            if self.phrase_feature_proj is not None
+            else None
+        )
         self.global_summary_proj = (
             nn.Sequential(
                 nn.Linear(H, config.output_dim),
@@ -470,14 +475,16 @@ class TimingEncoder(nn.Module):
             if config.enable_phrase_modulation and config.global_feature_dim > 0
             else None
         )
-
         self.stream_type_embedding = (
             nn.Parameter(torch.zeros(config.output_dim))
             if config.use_stream_type_embedding
             else None
         )
-        self.output_gate = nn.Parameter(torch.tensor(0.0))
-        self.global_gate = nn.Parameter(torch.tensor(0.0))
+        # Start both timing streams near-off so fresh-base training can
+        # introduce performance conditioning gradually instead of injecting
+        # half-strength random timing states on step 0.
+        self.output_gate = nn.Parameter(torch.tensor(-8.0))
+        self.global_gate = nn.Parameter(torch.tensor(-8.0))
 
         self.prediction_head = TimingPredictionHead(H)
 
@@ -486,10 +493,10 @@ class TimingEncoder(nn.Module):
     def _init_weights(self) -> None:
         for emb in list(self.feature_embeddings) + [self.feature_type_embeddings, self.pos_emb]:
             nn.init.normal_(emb.weight, std=0.02)
-        nn.init.xavier_uniform_(self.proj.weight)
+        nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
         if self.phrase_feature_proj is not None:
-            nn.init.xavier_uniform_(self.phrase_feature_proj[0].weight)
+            nn.init.zeros_(self.phrase_feature_proj[0].weight)
             nn.init.zeros_(self.phrase_feature_proj[0].bias)
         if self.global_summary_proj is not None:
             nn.init.xavier_uniform_(self.global_summary_proj[0].weight)
@@ -498,7 +505,7 @@ class TimingEncoder(nn.Module):
             nn.init.xavier_uniform_(self.global_feature_proj[0].weight)
             nn.init.zeros_(self.global_feature_proj[0].bias)
         if self.stream_type_embedding is not None:
-            nn.init.normal_(self.stream_type_embedding, std=0.02)
+            nn.init.zeros_(self.stream_type_embedding)
         self.prediction_head.reset_parameters()
 
     @staticmethod
@@ -542,7 +549,16 @@ class TimingEncoder(nn.Module):
                 raise ValueError("phrase_features were provided but phrase feature support is disabled")
             if phrase_features.ndim != 3:
                 raise ValueError(f"phrase_features must be [B, N, P], got {tuple(phrase_features.shape)}")
-            x = x + self.phrase_feature_proj(phrase_features.to(x.dtype))
+            phrase_inputs = torch.nan_to_num(
+                phrase_features.to(x.dtype),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp(min=-5.0, max=5.0)
+            phrase_hidden = self.phrase_feature_proj(phrase_inputs)
+            if self.phrase_gate is not None:
+                phrase_hidden = phrase_hidden * torch.sigmoid(self.phrase_gate)
+            x = x + phrase_hidden
 
         pad_mask = None if timing_mask is None else ~timing_mask
         hidden = self.transformer(x, src_key_padding_mask=pad_mask)

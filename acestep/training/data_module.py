@@ -161,9 +161,18 @@ class PreprocessedTensorDataset(Dataset):
             "timing_tokens": None,
             "timing_targets": None,
             "timing_mask": None,
+            "predictor_inputs": None,
+            "predictor_mask": None,
             "phrase_features": None,
             "global_phrase_features": None,
             "phrase_ids": None,
+            "f0_targets": None,
+            "energy_targets": None,
+            "terminal_decay": None,
+            "cv_ratio_targets": None,
+            "alignment_confidence": None,
+            "beat_confidence": None,
+            "release_targets": None,
             "timing_event_starts": None,
             "timing_event_ends": None,
             "timing_audio_duration": None,
@@ -187,9 +196,18 @@ class PreprocessedTensorDataset(Dataset):
                     sample["timing_tokens"] = tdata.get("timing_tokens")
                     sample["timing_targets"] = tdata.get("timing_targets")
                     sample["timing_mask"] = tdata.get("timing_mask")
+                    sample["predictor_inputs"] = tdata.get("predictor_inputs")
+                    sample["predictor_mask"] = tdata.get("predictor_mask")
                     sample["phrase_features"] = tdata.get("phrase_features")
                     sample["global_phrase_features"] = tdata.get("global_phrase_features")
                     sample["phrase_ids"] = tdata.get("phrase_ids")
+                    sample["f0_targets"] = tdata.get("f0_targets")
+                    sample["energy_targets"] = tdata.get("energy_targets")
+                    sample["terminal_decay"] = tdata.get("terminal_decay")
+                    sample["cv_ratio_targets"] = tdata.get("cv_ratio_targets")
+                    sample["alignment_confidence"] = tdata.get("alignment_confidence")
+                    sample["beat_confidence"] = tdata.get("beat_confidence")
+                    sample["release_targets"] = tdata.get("release_targets")
                     sample["timing_event_starts"] = tdata.get("event_start_sec")
                     sample["timing_event_ends"] = tdata.get("event_end_sec")
                     sample["timing_audio_duration"] = tdata.get("audio_duration_sec")
@@ -369,106 +387,163 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
             output["lyric_hidden_states"] = torch.stack(lyric_hidden_states_keep)
             output["lyric_attention_mask"] = torch.stack(lyric_attention_masks_keep)
 
-    # Phase D: collate timing features (pad to longest word sequence in batch)
-    any_timing = any(s.get("timing_tokens") is not None for s in batch)
-    if any_timing:
-        first_timing = next(s["timing_tokens"] for s in batch if s.get("timing_tokens") is not None)
-        first_targets = next(
-            (
-                s.get("timing_targets")
-                for s in batch
-                if s.get("timing_targets") is not None
-            ),
-            None,
-        )
-        max_words = max(
-            s["timing_tokens"].shape[0]
-            for s in batch
-            if s.get("timing_tokens") is not None
-        )
-        n_features = int(first_timing.shape[1])
+    # Phase E: collate timing, predictor, and expressivity sidecars.
+    def _first_non_none(key: str):
+        return next((s.get(key) for s in batch if s.get(key) is not None), None)
+
+    def _event_count(sample: Dict) -> int:
+        for key in (
+            "timing_tokens",
+            "predictor_inputs",
+            "timing_targets",
+            "phrase_features",
+            "f0_targets",
+            "timing_event_starts",
+        ):
+            value = sample.get(key)
+            if value is not None:
+                return int(value.shape[0])
+        return 0
+
+    any_event_sidecar = any(_event_count(s) > 0 for s in batch)
+    if any_event_sidecar:
+        max_words = max(_event_count(s) for s in batch)
+        first_timing = _first_non_none("timing_tokens")
+        first_targets = _first_non_none("timing_targets")
+        first_predictor = _first_non_none("predictor_inputs")
+        first_phrase = _first_non_none("phrase_features")
+        first_global_phrase = _first_non_none("global_phrase_features")
+        first_f0 = _first_non_none("f0_targets")
+        first_energy = _first_non_none("energy_targets")
+        first_terminal = _first_non_none("terminal_decay")
+        first_cv = _first_non_none("cv_ratio_targets")
+        n_features = int(first_timing.shape[1]) if first_timing is not None else 0
         n_targets = int(first_targets.shape[1]) if first_targets is not None else 0
-        first_phrase = next(
-            (s.get("phrase_features") for s in batch if s.get("phrase_features") is not None),
-            None,
-        )
-        first_global_phrase = next(
-            (s.get("global_phrase_features") for s in batch if s.get("global_phrase_features") is not None),
-            None,
-        )
+        predictor_feature_dim = int(first_predictor.shape[1]) if first_predictor is not None else 0
         phrase_feature_dim = int(first_phrase.shape[1]) if first_phrase is not None else 0
         global_phrase_dim = int(first_global_phrase.shape[0]) if first_global_phrase is not None else 0
+        f0_dim = int(first_f0.shape[1]) if first_f0 is not None else 0
+        energy_dim = int(first_energy.shape[1]) if first_energy is not None else 0
+        terminal_dim = int(first_terminal.shape[1]) if first_terminal is not None else 0
+        cv_dim = int(first_cv.shape[1]) if first_cv is not None else 0
+
         tok_batch, tgt_batch, mask_batch = [], [], []
+        predictor_batch, predictor_mask_batch = [], []
         phrase_batch, global_phrase_batch, phrase_id_batch = [], [], []
+        f0_batch, energy_batch, terminal_batch, cv_batch = [], [], [], []
+        align_conf_batch, beat_conf_batch, release_batch = [], [], []
         event_start_batch, event_end_batch, audio_durations = [], [], []
         for s in batch:
-            tt = s.get("timing_tokens")
-            if tt is None:
-                # Sample has no timing data: pad with zeros
-                tok_batch.append(torch.zeros(max_words, n_features, dtype=torch.long))
-                if n_targets > 0:
-                    tgt_batch.append(torch.zeros(max_words, n_targets, dtype=torch.float32))
-                mask_batch.append(torch.zeros(max_words, dtype=torch.bool))
-                if phrase_feature_dim > 0:
-                    phrase_batch.append(torch.zeros(max_words, phrase_feature_dim, dtype=torch.float32))
-                    phrase_id_batch.append(torch.zeros(max_words, dtype=torch.long))
-                if global_phrase_dim > 0:
-                    global_phrase_batch.append(torch.zeros(global_phrase_dim, dtype=torch.float32))
-                event_start_batch.append(torch.zeros(max_words, dtype=torch.float32))
-                event_end_batch.append(torch.zeros(max_words, dtype=torch.float32))
-                audio_durations.append(torch.tensor(0.0, dtype=torch.float32))
-            else:
-                N = tt.shape[0]
-                pad = max_words - N
-                tok_batch.append(torch.cat([tt, torch.zeros(pad, n_features, dtype=torch.long)], dim=0))
-                if n_targets > 0:
-                    tm = s.get("timing_targets")
-                    if tm is None:
-                        tm = torch.zeros(N, n_targets, dtype=torch.float32)
-                    tgt_batch.append(torch.cat([tm, torch.zeros(pad, n_targets, dtype=tm.dtype)], dim=0))
-                msk = s.get("timing_mask", torch.ones(N, dtype=torch.bool))
-                mask_batch.append(torch.cat([msk, torch.zeros(pad, dtype=torch.bool)], dim=0))
-                if phrase_feature_dim > 0:
-                    pf = s.get("phrase_features")
-                    if pf is None:
-                        pf = torch.zeros(N, phrase_feature_dim, dtype=torch.float32)
-                    phrase_batch.append(torch.cat([pf, torch.zeros(pad, phrase_feature_dim, dtype=pf.dtype)], dim=0))
-                    phrase_ids = s.get("phrase_ids")
-                    if phrase_ids is None:
-                        phrase_ids = torch.zeros(N, dtype=torch.long)
-                    phrase_id_batch.append(torch.cat([phrase_ids, torch.zeros(pad, dtype=phrase_ids.dtype)], dim=0))
-                if global_phrase_dim > 0:
-                    gpf = s.get("global_phrase_features")
-                    if gpf is None:
-                        gpf = torch.zeros(global_phrase_dim, dtype=torch.float32)
-                    global_phrase_batch.append(gpf.to(torch.float32))
-                ev_start = s.get("timing_event_starts")
-                if ev_start is None:
-                    ev_start = torch.zeros(N, dtype=torch.float32)
-                ev_end = s.get("timing_event_ends")
-                if ev_end is None:
-                    ev_end = torch.zeros(N, dtype=torch.float32)
-                event_start_batch.append(
-                    torch.cat([ev_start, torch.zeros(pad, dtype=ev_start.dtype)], dim=0)
-                )
-                event_end_batch.append(
-                    torch.cat([ev_end, torch.zeros(pad, dtype=ev_end.dtype)], dim=0)
-                )
-                audio_dur = s.get("timing_audio_duration")
-                if audio_dur is None:
-                    audio_dur = torch.tensor(0.0, dtype=torch.float32)
-                elif not isinstance(audio_dur, torch.Tensor):
-                    audio_dur = torch.tensor(float(audio_dur), dtype=torch.float32)
-                audio_durations.append(audio_dur.reshape(()).to(torch.float32))
-        output["timing_tokens"] = torch.stack(tok_batch)     # [B, N_words, 4]
+            N = _event_count(s)
+            pad = max_words - N
+            if n_features > 0:
+                tt = s.get("timing_tokens")
+                if tt is None:
+                    tt = torch.zeros(N, n_features, dtype=torch.long)
+                tok_batch.append(torch.cat([tt, torch.zeros(pad, n_features, dtype=tt.dtype)], dim=0))
+            if n_targets > 0:
+                tm = s.get("timing_targets")
+                if tm is None:
+                    tm = torch.zeros(N, n_targets, dtype=torch.float32)
+                tgt_batch.append(torch.cat([tm, torch.zeros(pad, n_targets, dtype=tm.dtype)], dim=0))
+
+            timing_mask = s.get("timing_mask")
+            predictor_mask = s.get("predictor_mask")
+            if timing_mask is None:
+                timing_mask = predictor_mask
+            if timing_mask is None:
+                timing_mask = torch.ones(N, dtype=torch.bool)
+            mask_batch.append(torch.cat([timing_mask, torch.zeros(pad, dtype=torch.bool)], dim=0))
+
+            if predictor_feature_dim > 0:
+                pi = s.get("predictor_inputs")
+                if pi is None:
+                    pi = torch.zeros(N, predictor_feature_dim, dtype=torch.long)
+                predictor_batch.append(torch.cat([pi, torch.zeros(pad, predictor_feature_dim, dtype=pi.dtype)], dim=0))
+                pm = predictor_mask if predictor_mask is not None else timing_mask[:N]
+                predictor_mask_batch.append(torch.cat([pm, torch.zeros(pad, dtype=torch.bool)], dim=0))
+
+            if phrase_feature_dim > 0:
+                pf = s.get("phrase_features")
+                if pf is None:
+                    pf = torch.zeros(N, phrase_feature_dim, dtype=torch.float32)
+                phrase_batch.append(torch.cat([pf, torch.zeros(pad, phrase_feature_dim, dtype=pf.dtype)], dim=0))
+                phrase_ids = s.get("phrase_ids")
+                if phrase_ids is None:
+                    phrase_ids = torch.zeros(N, dtype=torch.long)
+                phrase_id_batch.append(torch.cat([phrase_ids, torch.zeros(pad, dtype=phrase_ids.dtype)], dim=0))
+            if global_phrase_dim > 0:
+                gpf = s.get("global_phrase_features")
+                if gpf is None:
+                    gpf = torch.zeros(global_phrase_dim, dtype=torch.float32)
+                global_phrase_batch.append(gpf.to(torch.float32))
+
+            for key, dim, stack in (
+                ("f0_targets", f0_dim, f0_batch),
+                ("energy_targets", energy_dim, energy_batch),
+                ("terminal_decay", terminal_dim, terminal_batch),
+                ("cv_ratio_targets", cv_dim, cv_batch),
+            ):
+                if dim <= 0:
+                    continue
+                tensor = s.get(key)
+                if tensor is None:
+                    tensor = torch.zeros(N, dim, dtype=torch.float32)
+                stack.append(torch.cat([tensor, torch.zeros(pad, dim, dtype=tensor.dtype)], dim=0))
+
+            for key, stack, dtype in (
+                ("alignment_confidence", align_conf_batch, torch.float32),
+                ("beat_confidence", beat_conf_batch, torch.float32),
+                ("release_targets", release_batch, torch.long),
+            ):
+                tensor = s.get(key)
+                if tensor is None:
+                    tensor = torch.zeros(N, dtype=dtype)
+                stack.append(torch.cat([tensor, torch.zeros(pad, dtype=tensor.dtype)], dim=0))
+
+            ev_start = s.get("timing_event_starts")
+            if ev_start is None:
+                ev_start = torch.zeros(N, dtype=torch.float32)
+            ev_end = s.get("timing_event_ends")
+            if ev_end is None:
+                ev_end = torch.zeros(N, dtype=torch.float32)
+            event_start_batch.append(torch.cat([ev_start, torch.zeros(pad, dtype=ev_start.dtype)], dim=0))
+            event_end_batch.append(torch.cat([ev_end, torch.zeros(pad, dtype=ev_end.dtype)], dim=0))
+
+            audio_dur = s.get("timing_audio_duration")
+            if audio_dur is None:
+                audio_dur = torch.tensor(0.0, dtype=torch.float32)
+            elif not isinstance(audio_dur, torch.Tensor):
+                audio_dur = torch.tensor(float(audio_dur), dtype=torch.float32)
+            audio_durations.append(audio_dur.reshape(()).to(torch.float32))
+
+        if n_features > 0:
+            output["timing_tokens"] = torch.stack(tok_batch)
         if n_targets > 0:
             output["timing_targets"] = torch.stack(tgt_batch)
-        output["timing_mask"] = torch.stack(mask_batch)      # [B, N_words]
+        output["timing_mask"] = torch.stack(mask_batch)
+        if predictor_feature_dim > 0:
+            output["predictor_inputs"] = torch.stack(predictor_batch)
+            output["predictor_mask"] = torch.stack(predictor_mask_batch)
         if phrase_feature_dim > 0:
             output["phrase_features"] = torch.stack(phrase_batch)
             output["phrase_ids"] = torch.stack(phrase_id_batch)
         if global_phrase_dim > 0:
             output["global_phrase_features"] = torch.stack(global_phrase_batch)
+        if f0_dim > 0:
+            output["f0_targets"] = torch.stack(f0_batch)
+        if energy_dim > 0:
+            output["energy_targets"] = torch.stack(energy_batch)
+        if terminal_dim > 0:
+            output["terminal_decay"] = torch.stack(terminal_batch)
+        if cv_dim > 0:
+            output["cv_ratio_targets"] = torch.stack(cv_batch)
+        if align_conf_batch:
+            output["alignment_confidence"] = torch.stack(align_conf_batch)
+        if beat_conf_batch:
+            output["beat_confidence"] = torch.stack(beat_conf_batch)
+        if release_batch:
+            output["release_targets"] = torch.stack(release_batch)
         output["timing_event_starts"] = torch.stack(event_start_batch)
         output["timing_event_ends"] = torch.stack(event_end_batch)
         output["timing_audio_duration"] = torch.stack(audio_durations)
