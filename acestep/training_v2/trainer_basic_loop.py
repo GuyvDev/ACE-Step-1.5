@@ -170,6 +170,8 @@ def run_basic_training_loop(
     module.model.decoder.train()
 
     for epoch in range(start_epoch, cfg.max_epochs):
+        if hasattr(module, "apply_identity_curriculum"):
+            module.apply_identity_curriculum(epoch + 1)
         epoch_loss = 0.0
         num_updates = 0
         epoch_start = time.time()

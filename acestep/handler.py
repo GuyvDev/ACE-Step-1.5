@@ -162,6 +162,8 @@ class AceStepHandler(
         self.inference_timing_hidden_states = None
         self.inference_timing_attention_mask = None
         self.inference_timing_global_states = None
+        self.inference_voice_hidden_states = None
+        self.inference_voice_attention_mask = None
 
         # MLX DiT acceleration (macOS Apple Silicon only)
         self.mlx_decoder = None

@@ -75,6 +75,8 @@ class TrainingStats:
     current_step: int = 0
     total_steps_estimate: int = 0
     steps_this_session: int = 0
+    failed: bool = False
+    failure_message: str = ""
     peak_vram_mb: float = 0.0
     last_epoch_time: float = 0.0
     steps_per_epoch: int = 0
@@ -425,6 +427,9 @@ def _track_plain(
 
 def _process_structured(update: TrainingUpdate, stats: TrainingStats) -> None:
     """Extract stats from a TrainingUpdate."""
+    if update.kind == "fail":
+        stats.failed = True
+        stats.failure_message = update.msg
     stats.current_step = update.step
     stats.last_loss = update.loss
     stats.current_epoch = update.epoch

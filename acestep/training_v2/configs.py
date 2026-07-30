@@ -148,8 +148,72 @@ class TrainingConfigV2(TrainingConfig):
     speaker_loss_weight: float = 0.0
     """Weight for auxiliary speaker-consistency loss (0 disables)."""
 
+    contrastive_identity_loss_weight: float = 0.0
+    """Weight for MERT bridge InfoNCE identity loss (0 disables)."""
+
+    contrastive_num_negatives: int = 4
+    """Maximum number of queued in-dataset negatives for contrastive identity loss."""
+
+    contrastive_temperature: float = 0.07
+    """Temperature for MERT bridge InfoNCE identity loss."""
+
+    verifier_aux_weight: float = 0.0
+    """Backward-compatible weight for differentiable verifier-style auxiliary loss."""
+
+    wavlm_aux_weight: float = 0.0
+    """Weight for metric-distilled latent-to-WavLM cosine auxiliary loss."""
+
+    ecapa_aux_weight: float = 0.0
+    """Weight for metric-distilled latent-to-ECAPA cosine auxiliary loss."""
+
+    require_identity_sidecars: bool = False
+    """Fail training when enabled identity losses do not receive frozen sidecar targets."""
+
+    identity_sidecar_dir: Optional[str] = None
+    """Directory containing Phase B .identity.pt frozen target sidecars."""
+
+    spectral_formant_aux_weight: float = 0.0
+    """Weight for differentiable spectral/formant proxy auxiliary loss."""
+
+    pitch_style_aux_weight: float = 0.0
+    """Weight for differentiable pitch-style proxy auxiliary loss."""
+
+    identity_v5_enabled: bool = False
+    identity_v5_global_enabled: bool = True
+    identity_v5_local_enabled: bool = True
+    """Enable V5 fail-closed architecture/loss checks."""
+
+    identity_v5_stage2_encoder_json: Optional[str] = None
+    identity_v5_prototype_file: Optional[str] = None
+    """Selected encoder manifest produced by Stage 2 diagnostics."""
+
+    identity_v5_teacher_checkpoint: Optional[str] = None
+    """Frozen Phase A teacher checkpoint for preservation loss."""
+
+    identity_v5_teacher_loss_weight: float = 0.0
+    """Weight for Phase A teacher preservation loss."""
+
+    parent_preservation_loss_weight: float = 0.0
+    """Matched-input output-preservation weight for the exactly resumed parent."""
+
+    identity_v5_waveform_identity_weight: float = 0.0
+    identity_v5_student_checkpoint: Optional[str] = None
+    identity_v5_decoded_batch_fraction: float = 0.25
+    identity_v5_epoch_eval_command: Optional[str] = None
+    identity_v5_epoch_eval_timeout_sec: int = 7200
+    """Weight for verified differentiable decoded identity loss."""
+
+    identity_v5_supcon_weight: float = 0.0
+    """Weight for distinct-singer supervised contrastive prototype loss."""
+
     use_mert_conditioning: bool = False
     """Enable optional precomputed MERT reference-voice conditioning."""
+
+    require_complete_mert: bool = False
+    """Require MERT on every sample when enabled; false in the first controlled Phase-D test."""
+
+    preserve_mert_init_rng_without_conditioning: bool = False
+    """Consume historical MERT-bridge initialization RNG without retaining MERT."""
 
     mert_model_name_or_path: str = "m-a-p/MERT-v1-330M"
     """Model name or local path used during preprocessing to extract MERT features."""
@@ -171,6 +235,15 @@ class TrainingConfigV2(TrainingConfig):
 
     max_ref_voice_duration: float = 3.0
     """Maximum duration for reference-voice clips during preprocessing."""
+
+    use_multicrop_mert_conditioning: bool = False
+    """Enable V3 multi-crop MERT reference conditioning."""
+
+    top_k_reference_crops: int = 3
+    """Number of reference crops extracted for V3 MERT conditioning."""
+
+    crop_duration: float = 3.0
+    """Duration in seconds for each V3 MERT reference crop."""
 
     timestep_mu: float = -0.4
     """Mean for logit-normal timestep sampling (from model config)."""
@@ -205,6 +278,29 @@ class TrainingConfigV2(TrainingConfig):
     # --- Checkpointing ------------------------------------------------------
     resume_from: Optional[str] = None
     """Path to checkpoint directory to resume training from."""
+
+    resume_optimizer_state: bool = True
+    """Restore optimizer/scheduler state when resuming; disable for a new training phase."""
+
+    phase_d_resume_adapter: Optional[str] = None
+    phase_d_scheduler_policy: Optional[str] = None
+    phase_d_optimizer_policy: Optional[str] = None
+    freeze_base_adapter_in_phase_d: bool = False
+    """Freeze the inherited non-timing LoRA during controlled Phase D."""
+    phase_d_clarity_replay_enabled: bool = False
+    """Train the base LoRA at a low LR on a verified full-song/short-clip union."""
+    phase_d_d1_alternating_roles_enabled: bool = False
+    """Use the fail-closed D1 short, short, full optimizer-step schedule."""
+    phase_d_role_manifest_path: Optional[str] = None
+    """Immutable mixed-dataset provenance manifest used to assign D1 roles."""
+    phase_d_require_parent_timing_state: bool = False
+    """Require and exactly verify timing_branch.pt during controlled resume."""
+    strict_timing_state_load: bool = False
+    max_optimizer_steps: int = 0
+    phase_d_probe_steps: str = ""
+    phase_d_probe_dir: Optional[str] = None
+    phase_d_fixed_latent_path: Optional[str] = None
+    experiment_manifest_out: Optional[str] = None
 
     # --- Extended TensorBoard logging ---------------------------------------
     log_dir: Optional[str] = None
@@ -259,10 +355,19 @@ class TrainingConfigV2(TrainingConfig):
     enable_timing_branch: bool = False
     """Enable the beat-aware word-aligned timing conditioning branch (Phase D)."""
 
+    timing_init_profile: str = "safe"
+    """Fresh timing-branch initialization profile: safe or historical_v4."""
+
+    timing_max_seq_len: int = 0
+    """Timing encoder position-table length. 0 preserves profile defaults."""
+
+    timing_gate_init_logit: float = -4.0
+    """Initial decoder timing-gate logit. Historical Phase D used -4."""
+
     timing_dir: Optional[str] = None
-    """Directory containing .timing.pt sidecar files produced by extract_timing_features.py.
-    If None but enable_timing_branch=True, the branch is silently skipped for samples
-    without timing sidecars."""
+    """Directory containing .timing.pt sidecars. Controlled Phase-D requires every sidecar."""
+
+    strict_sidecars: bool = False
 
     timing_hidden_size: int = 256
     """Internal hidden size of the TimingEncoder transformer."""
@@ -319,6 +424,33 @@ class TrainingConfigV2(TrainingConfig):
     enable_phrase_modulation: bool = False
     """Enable phrase/global timing-state modulation on top of event timing cross-attention (Phase E1)."""
 
+    enable_absolute_time_conditioning: bool = False
+    """Encode normalized absolute event start/end positions in the timing stream."""
+
+    timing_attention_prior: str = "global"
+    """Timing attention topology: global or local_monotonic."""
+
+    timing_local_sigma_sec: float = 1.0
+    """Gaussian distance scale for local monotonic timing attention."""
+
+    timing_local_window_sec: float = 3.0
+    """Hard event window around each audio query for local timing attention."""
+
+    timing_event_flow_weight: float = 0.0
+    """Additional flow-loss weight on frames covered by aligned lyric events."""
+
+    timing_event_flow_margin_sec: float = 0.08
+    """Seconds of context added around each event for event-weighted flow loss."""
+
+    timing_counterfactual_weight: float = 0.0
+    """Weight for correct-vs-shifted timing reconstruction ranking."""
+
+    timing_counterfactual_shift_sec: float = 8.0
+    """Absolute shift used to construct the counterfactual timing mask."""
+
+    timing_counterfactual_margin: float = 0.002
+    """Required per-sample flow-MSE advantage over shifted timing."""
+
     timing_global_condition_scale: float = 1.0
     """Scale applied to the phrase/global timing modulation vector before decoder use."""
 
@@ -332,6 +464,24 @@ class TrainingConfigV2(TrainingConfig):
         default_factory=lambda: ["q_proj", "o_proj"]
     )
     """Timing cross-attention adapter modules to train for low-data Phase E runs."""
+
+    timing_encoder_learning_rate: float = 0.0
+    """Dedicated timing encoder/supervisor LR; 0 inherits the base LR."""
+
+    timing_gate_learning_rate: float = 0.0
+    """Dedicated FP32 decoder timing-gate LR; 0 inherits the base LR."""
+
+    timing_consumer_learning_rate: float = 0.0
+    """Dedicated timing cross-attention consumer LR; 0 inherits the base LR."""
+
+    timing_telemetry_every: int = 0
+    """Write timing health telemetry every N optimizer steps; 0 disables."""
+
+    timing_hazard_patience: int = 5
+    """Active timing steps tolerated before a stalled gradient/gate becomes a hazard."""
+
+    timing_fail_on_hazard: bool = False
+    """Abort immediately when timing health monitoring detects a hard hazard."""
 
     enable_timing_predictor: bool = False
     """Enable the Phase E2 timing predictor foundation."""
@@ -409,7 +559,33 @@ class TrainingConfigV2(TrainingConfig):
                 "vram_profile": self.vram_profile,
                 "adapter_type": self.adapter_type,
                 "cfg_ratio": self.cfg_ratio,
+                "contrastive_identity_loss_weight": self.contrastive_identity_loss_weight,
+                "contrastive_num_negatives": self.contrastive_num_negatives,
+                "contrastive_temperature": self.contrastive_temperature,
+                "verifier_aux_weight": self.verifier_aux_weight,
+                "wavlm_aux_weight": self.wavlm_aux_weight,
+                "ecapa_aux_weight": self.ecapa_aux_weight,
+                "require_identity_sidecars": self.require_identity_sidecars,
+                "identity_sidecar_dir": self.identity_sidecar_dir,
+                "spectral_formant_aux_weight": self.spectral_formant_aux_weight,
+                "pitch_style_aux_weight": self.pitch_style_aux_weight,
+                "identity_v5_enabled": self.identity_v5_enabled,
+                "identity_v5_global_enabled": self.identity_v5_global_enabled,
+                "identity_v5_local_enabled": self.identity_v5_local_enabled,
+                "identity_v5_stage2_encoder_json": self.identity_v5_stage2_encoder_json,
+                "identity_v5_prototype_file": self.identity_v5_prototype_file,
+                "identity_v5_teacher_checkpoint": self.identity_v5_teacher_checkpoint,
+                "identity_v5_teacher_loss_weight": self.identity_v5_teacher_loss_weight,
+                "parent_preservation_loss_weight": self.parent_preservation_loss_weight,
+                "identity_v5_waveform_identity_weight": self.identity_v5_waveform_identity_weight,
+                "identity_v5_student_checkpoint": self.identity_v5_student_checkpoint,
+                "identity_v5_decoded_batch_fraction": self.identity_v5_decoded_batch_fraction,
+                "identity_v5_epoch_eval_command": self.identity_v5_epoch_eval_command,
+                "identity_v5_epoch_eval_timeout_sec": self.identity_v5_epoch_eval_timeout_sec,
+                "identity_v5_supcon_weight": self.identity_v5_supcon_weight,
                 "use_mert_conditioning": self.use_mert_conditioning,
+                "require_complete_mert": self.require_complete_mert,
+                "preserve_mert_init_rng_without_conditioning": self.preserve_mert_init_rng_without_conditioning,
                 "mert_model_name_or_path": self.mert_model_name_or_path,
                 "mert_local_files_only": self.mert_local_files_only,
                 "mert_hidden_size": self.mert_hidden_size,
@@ -417,6 +593,9 @@ class TrainingConfigV2(TrainingConfig):
                 "voice_condition_dropout": self.voice_condition_dropout,
                 "voice_condition_scale": self.voice_condition_scale,
                 "max_ref_voice_duration": self.max_ref_voice_duration,
+                "use_multicrop_mert_conditioning": self.use_multicrop_mert_conditioning,
+                "top_k_reference_crops": self.top_k_reference_crops,
+                "crop_duration": self.crop_duration,
                 "timestep_mu": self.timestep_mu,
                 "timestep_sigma": self.timestep_sigma,
                 "data_proportion": self.data_proportion,
@@ -426,6 +605,21 @@ class TrainingConfigV2(TrainingConfig):
                 "device": self.device,
                 "precision": self.precision,
                 "resume_from": self.resume_from,
+                "resume_optimizer_state": self.resume_optimizer_state,
+                "phase_d_resume_adapter": self.phase_d_resume_adapter,
+                "phase_d_scheduler_policy": self.phase_d_scheduler_policy,
+                "phase_d_optimizer_policy": self.phase_d_optimizer_policy,
+                "freeze_base_adapter_in_phase_d": self.freeze_base_adapter_in_phase_d,
+                "phase_d_clarity_replay_enabled": self.phase_d_clarity_replay_enabled,
+                "phase_d_d1_alternating_roles_enabled": self.phase_d_d1_alternating_roles_enabled,
+                "phase_d_role_manifest_path": self.phase_d_role_manifest_path,
+                "phase_d_require_parent_timing_state": self.phase_d_require_parent_timing_state,
+                "strict_timing_state_load": self.strict_timing_state_load,
+                "max_optimizer_steps": self.max_optimizer_steps,
+                "phase_d_probe_steps": self.phase_d_probe_steps,
+                "phase_d_probe_dir": self.phase_d_probe_dir,
+                "phase_d_fixed_latent_path": self.phase_d_fixed_latent_path,
+                "experiment_manifest_out": self.experiment_manifest_out,
                 "log_dir": self.log_dir,
                 "log_every": self.log_every,
                 "log_heavy_every": self.log_heavy_every,
@@ -443,7 +637,11 @@ class TrainingConfigV2(TrainingConfig):
                 "max_duration": self.max_duration,
                 # Phase D: timing branch
                 "enable_timing_branch": self.enable_timing_branch,
+                "timing_init_profile": self.timing_init_profile,
+                "timing_max_seq_len": self.timing_max_seq_len,
+                "timing_gate_init_logit": self.timing_gate_init_logit,
                 "timing_dir": self.timing_dir,
+                "strict_sidecars": self.strict_sidecars,
                 "timing_hidden_size": self.timing_hidden_size,
                 "timing_num_heads": self.timing_num_heads,
                 "timing_num_layers": self.timing_num_layers,
@@ -462,10 +660,25 @@ class TrainingConfigV2(TrainingConfig):
                 "timing_decoder_loss_weight": self.timing_decoder_loss_weight,
                 "enable_timing_consumer_training": self.enable_timing_consumer_training,
                 "enable_phrase_modulation": self.enable_phrase_modulation,
+                "enable_absolute_time_conditioning": self.enable_absolute_time_conditioning,
+                "timing_attention_prior": self.timing_attention_prior,
+                "timing_local_sigma_sec": self.timing_local_sigma_sec,
+                "timing_local_window_sec": self.timing_local_window_sec,
+                "timing_event_flow_weight": self.timing_event_flow_weight,
+                "timing_event_flow_margin_sec": self.timing_event_flow_margin_sec,
+                "timing_counterfactual_weight": self.timing_counterfactual_weight,
+                "timing_counterfactual_shift_sec": self.timing_counterfactual_shift_sec,
+                "timing_counterfactual_margin": self.timing_counterfactual_margin,
                 "timing_global_condition_scale": self.timing_global_condition_scale,
                 "timing_global_bottleneck_dim": self.timing_global_bottleneck_dim,
                 "timing_train_last_n_layers": self.timing_train_last_n_layers,
                 "timing_consumer_adapter_modules": self.timing_consumer_adapter_modules,
+                "timing_encoder_learning_rate": self.timing_encoder_learning_rate,
+                "timing_gate_learning_rate": self.timing_gate_learning_rate,
+                "timing_consumer_learning_rate": self.timing_consumer_learning_rate,
+                "timing_telemetry_every": self.timing_telemetry_every,
+                "timing_hazard_patience": self.timing_hazard_patience,
+                "timing_fail_on_hazard": self.timing_fail_on_hazard,
                 "enable_timing_predictor": self.enable_timing_predictor,
                 "timing_condition_source": self.timing_condition_source,
                 "timing_predictor_loss_weight": self.timing_predictor_loss_weight,

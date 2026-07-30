@@ -123,6 +123,8 @@ class GenerateMusicMixin:
         timesteps: Optional[List[float]] = None,
         latent_shift: float = 0.0,
         latent_rescale: float = 1.0,
+        initial_noise: Optional[torch.Tensor] = None,  # PHASE_D_FIXED_LATENT_V1
+        require_initial_noise: bool = False,  # PHASE_D_FIXED_LATENT_V1
         progress=None,
     ) -> Dict[str, Any]:
         """Generate audio from text/reference inputs and return response payload.
@@ -231,6 +233,8 @@ class GenerateMusicMixin:
                 cfg_interval_end=cfg_interval_end,
                 shift=shift,
                 infer_method=infer_method,
+                initial_noise=initial_noise,  # PHASE_D_FIXED_LATENT_V1
+                require_initial_noise=require_initial_noise,  # PHASE_D_FIXED_LATENT_V1
             )
             outputs = service_run["outputs"]
             infer_steps_for_progress = service_run["infer_steps_for_progress"]

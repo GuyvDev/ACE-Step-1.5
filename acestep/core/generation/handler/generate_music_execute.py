@@ -33,6 +33,8 @@ class GenerateMusicExecuteMixin:
         cfg_interval_end: float,
         shift: float,
         infer_method: str,
+        initial_noise,  # PHASE_D_FIXED_LATENT_V1
+        require_initial_noise: bool,  # PHASE_D_FIXED_LATENT_V1
     ) -> Dict[str, Any]:
         """Invoke ``service_generate`` while maintaining background progress estimation.
 
@@ -79,6 +81,8 @@ class GenerateMusicExecuteMixin:
                     audio_code_hints=service_inputs["audio_code_hints_batch"],
                     return_intermediate=service_inputs["should_return_intermediate"],
                     timesteps=timesteps,
+                    initial_noise=initial_noise,  # PHASE_D_FIXED_LATENT_V1
+                    require_initial_noise=require_initial_noise,  # PHASE_D_FIXED_LATENT_V1
                 )
             except Exception as exc:
                 _error["exc"] = exc

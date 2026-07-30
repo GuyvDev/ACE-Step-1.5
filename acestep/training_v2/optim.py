@@ -21,6 +21,7 @@ Supported schedulers:
 from __future__ import annotations
 
 import logging
+import math
 from typing import Iterable
 
 import torch
@@ -29,6 +30,7 @@ from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
     CosineAnnealingWarmRestarts,
     ConstantLR,
+    LRScheduler,
     LinearLR,
     SequentialLR,
 )
@@ -47,9 +49,9 @@ def build_optimizer(
     weight_decay: float = 0.01,
     device_type: str = "cuda",
 ) -> torch.optim.Optimizer:
-    """Create an optimizer from a string key.
+    """Create exactly the requested optimizer or raise.
 
-    Falls back to AdamW when an optional dependency is missing.
+    Missing optional dependencies and unknown optimizer names are fatal.
     """
     optimizer_type = optimizer_type.lower().strip()
 
@@ -58,12 +60,10 @@ def build_optimizer(
             from bitsandbytes.optim import AdamW8bit
             logger.info("[Side-Step] Using AdamW8bit optimizer (lower VRAM)")
             return AdamW8bit(params, lr=lr, weight_decay=weight_decay)
-        except ImportError:
-            logger.warning(
-                "[Side-Step] bitsandbytes not installed -- falling back to AdamW. "
-                "Install with: pip install bitsandbytes>=0.45.0"
-            )
-            optimizer_type = "adamw"
+        except ImportError as exc:
+            raise RuntimeError(
+                "optimizer_type='adamw8bit' requires bitsandbytes>=0.45.0"
+            ) from exc
 
     if optimizer_type == "adafactor":
         try:
@@ -76,11 +76,10 @@ def build_optimizer(
                 scale_parameter=False,
                 relative_step=False,
             )
-        except ImportError:
-            logger.warning(
-                "[Side-Step] transformers not installed -- falling back to AdamW"
-            )
-            optimizer_type = "adamw"
+        except ImportError as exc:
+            raise RuntimeError(
+                "optimizer_type='adafactor' requires transformers"
+            ) from exc
 
     if optimizer_type == "prodigy":
         try:
@@ -90,17 +89,16 @@ def build_optimizer(
             )
             return Prodigy(
                 params,
-                lr=lr if lr != 1e-4 else 1.0,  # Default to 1.0 for Prodigy
+                lr=lr,
                 weight_decay=weight_decay,
             )
-        except ImportError:
-            logger.warning(
-                "[Side-Step] prodigyopt not installed -- falling back to AdamW. "
-                "Install with: pip install prodigyopt>=1.1.2"
-            )
-            optimizer_type = "adamw"
+        except ImportError as exc:
+            raise RuntimeError(
+                "optimizer_type='prodigy' requires prodigyopt>=1.1.2"
+            ) from exc
 
-    # Default: AdamW
+    if optimizer_type != "adamw":
+        raise ValueError(f"unsupported optimizer_type: {optimizer_type!r}")
     kwargs = {"lr": lr, "weight_decay": weight_decay}
     if device_type == "cuda":
         kwargs["fused"] = True
@@ -111,6 +109,38 @@ def build_optimizer(
 # ---------------------------------------------------------------------------
 # Scheduler factory
 # ---------------------------------------------------------------------------
+
+
+class GroupRatioCosineAnnealingLR(LRScheduler):
+    """Cosine decay by one scalar factor, preserving every group LR ratio."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        T_max: int,
+        min_factor: float = 0.01,
+        last_epoch: int = -1,
+    ) -> None:
+        if int(T_max) <= 0:
+            raise ValueError(f"T_max must be positive, got {T_max}")
+        if not 0.0 <= float(min_factor) <= 1.0:
+            raise ValueError(f"min_factor must be in [0,1], got {min_factor}")
+        self.T_max = int(T_max)
+        self.min_factor = float(min_factor)
+        super().__init__(optimizer, last_epoch=last_epoch)
+
+    def _factor(self, step: int) -> float:
+        progress = min(max(int(step), 0), self.T_max) / self.T_max
+        return self.min_factor + (1.0 - self.min_factor) * 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    def get_lr(self) -> list[float]:
+        factor = self._factor(self.last_epoch)
+        return [base_lr * factor for base_lr in self.base_lrs]
+
+    def _get_closed_form_lr(self) -> list[float]:
+        return self.get_lr()
 
 def build_scheduler(
     optimizer: torch.optim.Optimizer,
@@ -132,23 +162,23 @@ def build_scheduler(
     """
     scheduler_type = scheduler_type.lower().strip()
 
-    # Prodigy handles its own LR -- force constant
     if optimizer_type == "prodigy" and scheduler_type not in ("constant", "constant_with_warmup"):
-        logger.info(
-            "[Side-Step] Prodigy optimizer detected -- overriding scheduler to 'constant' "
-            "(Prodigy adapts LR internally)"
+        raise ValueError("Prodigy requires an explicitly selected constant scheduler")
+    if total_steps <= 0:
+        raise ValueError("total_steps must be positive")
+    warmup_steps = int(warmup_steps)
+    if warmup_steps < 0 or warmup_steps >= total_steps:
+        raise ValueError(
+            f"warmup_steps must be in [0, total_steps), got {warmup_steps}/{total_steps}"
         )
-        scheduler_type = "constant"
-
-    # Clamp warmup to avoid exceeding total
-    warmup_steps = min(warmup_steps, max(1, total_steps // 10))
-
-    warmup_sched = LinearLR(
-        optimizer,
-        start_factor=0.1,
-        end_factor=1.0,
-        total_iters=warmup_steps,
-    )
+    warmup_sched = None
+    if warmup_steps > 0:
+        warmup_sched = LinearLR(
+            optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
 
     remaining = max(1, total_steps - warmup_steps)
 
@@ -170,12 +200,24 @@ def build_scheduler(
             T_mult=1,
             eta_min=lr * 0.01,
         )
+    elif scheduler_type == "cosine":
+        # Preserve per-group LR ratios for timing training.  A scalar eta_min
+        # would collapse every group toward the base LR floor.
+        if len(optimizer.param_groups) > 1:
+            main_sched = GroupRatioCosineAnnealingLR(
+                optimizer,
+                T_max=remaining,
+                min_factor=0.01,
+            )
+        else:
+            main_sched = CosineAnnealingLR(
+                optimizer,
+                T_max=remaining,
+                eta_min=lr * 0.01,
+            )
     else:
-        # cosine (default) -- single smooth decay to eta_min, no restarts.
-        main_sched = CosineAnnealingLR(
-            optimizer,
-            T_max=remaining,
-            eta_min=lr * 0.01,
-        )
+        raise ValueError(f"unsupported scheduler_type: {scheduler_type!r}")
 
+    if warmup_sched is None:
+        return main_sched
     return SequentialLR(optimizer, [warmup_sched, main_sched], milestones=[warmup_steps])

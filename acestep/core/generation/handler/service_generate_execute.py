@@ -73,6 +73,8 @@ class ServiceGenerateExecuteMixin:
         cfg_interval_end: float,
         shift: float,
         timesteps: Optional[List[float]],
+        initial_noise: Optional[torch.Tensor],  # PHASE_D_FIXED_LATENT_V1
+        require_initial_noise: bool,  # PHASE_D_FIXED_LATENT_V1
     ) -> Dict[str, Any]:
         """Build kwargs passed to model generation backends."""
         kwargs = {
@@ -87,6 +89,8 @@ class ServiceGenerateExecuteMixin:
             "is_covers": payload["is_covers"],
             "silence_latent": self.silence_latent,
             "seed": seed_param,
+            "initial_noise": initial_noise,  # PHASE_D_FIXED_LATENT_V1
+            "require_initial_noise": bool(require_initial_noise),  # PHASE_D_FIXED_LATENT_V1
             "non_cover_text_hidden_states": payload["non_cover_text_hidden_states"],
             "non_cover_text_attention_mask": payload["non_cover_text_attention_masks"],
             "precomputed_lm_hints_25Hz": payload["precomputed_lm_hints_25Hz"],
@@ -108,6 +112,17 @@ class ServiceGenerateExecuteMixin:
             kwargs["timing_attention_mask"] = timing_attention_mask
         if timing_global_states is not None:
             kwargs["timing_global_states"] = timing_global_states
+        voice_hidden_states = getattr(self, "inference_voice_hidden_states", None)
+        voice_attention_mask = getattr(self, "inference_voice_attention_mask", None)
+        if voice_hidden_states is not None and voice_attention_mask is not None:
+            kwargs["identity_voice_hidden_states"] = voice_hidden_states
+            kwargs["identity_voice_attention_mask"] = voice_attention_mask
+        identity_v5 = getattr(self, "inference_identity_v5", None)
+        if identity_v5:
+            kwargs["identity_block_adapters"] = identity_v5["block_adapters"] if identity_v5["global_enabled"] else None
+            kwargs["identity_singer_embedding"] = identity_v5["singer_embedding"] if identity_v5["global_enabled"] else None
+            kwargs["identity_fragment_attention"] = identity_v5["fragment_attention"] if identity_v5["local_enabled"] else None
+            kwargs["identity_voice_crop_ids"] = identity_v5["crop_ids"]
         if timesteps is not None:
             kwargs["timesteps"] = torch.tensor(timesteps, dtype=torch.float32, device=self.device)
         return kwargs
@@ -148,6 +163,30 @@ class ServiceGenerateExecuteMixin:
                     is_covers=payload["is_covers"],
                     precomputed_lm_hints_25Hz=payload["precomputed_lm_hints_25Hz"],
                 )
+                voice_hidden_states = getattr(self, "inference_voice_hidden_states", None)
+                voice_attention_mask = getattr(self, "inference_voice_attention_mask", None)
+                if voice_hidden_states is not None and voice_attention_mask is not None:
+                    voice_hidden_states = voice_hidden_states.to(
+                        device=encoder_hidden_states.device,
+                        dtype=encoder_hidden_states.dtype,
+                    )
+                    voice_attention_mask = voice_attention_mask.to(
+                        device=encoder_attention_mask.device,
+                        dtype=encoder_attention_mask.dtype,
+                    )
+                    if voice_hidden_states.shape[0] != encoder_hidden_states.shape[0]:
+                        voice_hidden_states = voice_hidden_states.expand(
+                            encoder_hidden_states.shape[0], -1, -1
+                        )
+                        voice_attention_mask = voice_attention_mask.expand(
+                            encoder_attention_mask.shape[0], -1
+                        )
+                    encoder_hidden_states = torch.cat(
+                        [encoder_hidden_states, voice_hidden_states], dim=1
+                    )
+                    encoder_attention_mask = torch.cat(
+                        [encoder_attention_mask, voice_attention_mask], dim=1
+                    )
 
                 if self.use_mlx_dit and self.mlx_decoder is not None:
                     try:

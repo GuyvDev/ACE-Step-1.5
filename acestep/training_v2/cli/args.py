@@ -254,12 +254,30 @@ def _add_common_training_args(parser: argparse.ArgumentParser) -> None:
     g_ckpt.add_argument("--output-dir", type=str, required=True, help="Output directory for LoRA weights")
     g_ckpt.add_argument("--save-every", type=int, default=10, help="Save checkpoint every N epochs (default: 10)")
     g_ckpt.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint dir to resume from")
+    g_ckpt.add_argument(
+        "--resume-optimizer-state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Restore optimizer and scheduler state from the checkpoint (disable when starting a new phase)",
+    )
+    g_ckpt.add_argument("--phase-d-resume-adapter", choices=["verified", "fresh"], default=None, help="Causal-ablation adapter restore policy; unset preserves normal resume behavior")
+    g_ckpt.add_argument("--phase-d-scheduler-policy", choices=["fresh", "inherit"], default=None, help="Causal-ablation scheduler restore policy")
+    g_ckpt.add_argument("--phase-d-optimizer-policy", choices=["fresh", "inherit"], default=None, help="Causal-ablation optimizer restore policy")
+    g_ckpt.add_argument("--strict-timing-state-load", action=argparse.BooleanOptionalAction, default=False, help="Fail on incomplete or incompatible Phase-D state loading")
+    g_ckpt.add_argument("--max-optimizer-steps", type=int, default=0, help="Stop after this many local optimizer updates; 0 disables")
+    g_ckpt.add_argument("--phase-d-probe-steps", type=str, default="", help="Comma-separated local optimizer steps to checkpoint and measure")
+    g_ckpt.add_argument("--phase-d-probe-dir", type=str, default=None)
+    g_ckpt.add_argument("--phase-d-fixed-latent-path", type=str, default=None)
+    g_ckpt.add_argument("--experiment-manifest-out", type=str, default=None)
 
     # -- Logging / TensorBoard -----------------------------------------------
     g_log = parser.add_argument_group("Logging / TensorBoard")
     g_log.add_argument("--log-dir", type=str, default=None, help="TensorBoard log directory (default: {output-dir}/runs)")
     g_log.add_argument("--log-every", type=int, default=10, help="Log basic metrics every N steps (default: 10)")
     g_log.add_argument("--log-heavy-every", type=int, default=50, help="Log per-layer gradient norms every N steps (default: 50)")
+    g_log.add_argument("--timing-telemetry-every", type=int, default=0, help="Write timing health telemetry every N optimizer steps; 0 disables")
+    g_log.add_argument("--timing-hazard-patience", type=int, default=5, help="Active timing steps before a stalled branch is hazardous")
+    g_log.add_argument("--timing-fail-on-hazard", action=argparse.BooleanOptionalAction, default=False, help="Abort when timing telemetry detects a hard hazard")
     g_log.add_argument("--sample-every-n-epochs", type=int, default=0, help="Generate audio sample every N epochs; 0=disabled (default: 0)")
     g_log.add_argument("--validate-every", type=int, default=1, help="Run validation every N epochs when val_split > 0 (default: 1)")
     g_log.add_argument("--early-stopping-patience", type=int, default=0, help="Stop after this many non-improving validations; 0 disables (default: 0)")
@@ -292,10 +310,90 @@ def _add_fixed_args(parser: argparse.ArgumentParser) -> None:
         help="Auxiliary speaker-consistency loss weight (default: 0.0, disabled)",
     )
     g.add_argument(
+        "--contrastive-identity-loss-weight",
+        type=float,
+        default=0.0,
+        help="MERT bridge InfoNCE identity loss weight (default: 0.0, disabled)",
+    )
+    g.add_argument(
+        "--contrastive-num-negatives",
+        type=int,
+        default=4,
+        help="Maximum queued in-dataset negatives for contrastive identity loss (default: 4)",
+    )
+    g.add_argument(
+        "--contrastive-temperature",
+        type=float,
+        default=0.07,
+        help="Temperature for contrastive identity loss (default: 0.07)",
+    )
+    g.add_argument(
+        "--verifier-aux-weight",
+        type=float,
+        default=0.0,
+        help="Backward-compatible verifier-style aux loss weight (default: 0.0)",
+    )
+    g.add_argument(
+        "--wavlm-aux-weight",
+        type=float,
+        default=0.0,
+        help="Metric-distilled latent-to-WavLM aux loss weight (default: 0.0)",
+    )
+    g.add_argument(
+        "--ecapa-aux-weight",
+        type=float,
+        default=0.0,
+        help="Metric-distilled latent-to-ECAPA aux loss weight (default: 0.0)",
+    )
+    g.add_argument(
+        "--identity-sidecar-dir",
+        type=str,
+        default=None,
+        help="Directory containing Phase B .identity.pt frozen target sidecars",
+    )
+    g.add_argument(
+        "--require-identity-sidecars",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fail if enabled identity losses do not receive frozen sidecar targets",
+    )
+    g.add_argument(
+        "--spectral-formant-aux-weight",
+        type=float,
+        default=0.0,
+        help="Differentiable spectral/formant proxy aux loss weight (default: 0.0)",
+    )
+    g.add_argument(
+        "--pitch-style-aux-weight",
+        type=float,
+        default=0.0,
+        help="Differentiable pitch-style proxy aux loss weight (default: 0.0)",
+    )
+    g.add_argument("--identity-v5-enabled", action=argparse.BooleanOptionalAction, default=False, help="Enable V5 fail-closed architecture/loss checks")
+    g.add_argument("--identity-v5-global-enabled", action=argparse.BooleanOptionalAction, default=True)
+    g.add_argument("--identity-v5-local-enabled", action=argparse.BooleanOptionalAction, default=True)
+    g.add_argument("--identity-v5-stage2-encoder-json", type=str, default=None, help="Stage 2 selected_encoder.json")
+    g.add_argument("--identity-v5-prototype-file", type=str, default=None)
+    g.add_argument("--identity-v5-teacher-checkpoint", type=str, default=None, help="Frozen Phase A teacher checkpoint for V5 preservation loss")
+    g.add_argument("--identity-v5-teacher-loss-weight", type=float, default=0.0, help="V5 Phase A teacher loss weight")
+    g.add_argument("--parent-preservation-loss-weight", type=float, default=0.0, help="Matched-input resumed-parent preservation weight")
+    g.add_argument("--identity-v5-waveform-identity-weight", type=float, default=0.0, help="V5 differentiable waveform identity loss weight")
+    g.add_argument("--identity-v5-student-checkpoint", type=str, default=None)
+    g.add_argument("--identity-v5-decoded-batch-fraction", type=float, default=0.25)
+    g.add_argument("--identity-v5-epoch-eval-command", type=str, default=None)
+    g.add_argument("--identity-v5-epoch-eval-timeout-sec", type=int, default=7200)
+    g.add_argument("--identity-v5-supcon-weight", type=float, default=0.0, help="V5 distinct-singer supervised contrastive loss weight")
+    g.add_argument(
         "--use-mert-conditioning",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable optional precomputed MERT reference-voice conditioning",
+    )
+    g.add_argument(
+        "--preserve-mert-init-rng-without-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reproduce historical timing-module RNG after removing MERT; retains no MERT module",
     )
     g.add_argument(
         "--mert-model-name-or-path",
@@ -340,6 +438,24 @@ def _add_fixed_args(parser: argparse.ArgumentParser) -> None:
         help="Maximum reference clip duration during preprocessing (default: 3.0)",
     )
     g.add_argument(
+        "--use-multicrop-mert-conditioning",
+        action="store_true",
+        default=False,
+        help="Enable V3 multi-crop MERT reference conditioning with learned crop attention",
+    )
+    g.add_argument(
+        "--top-k-reference-crops",
+        type=int,
+        default=3,
+        help="Number of V3 reference crops to aggregate (default: 3)",
+    )
+    g.add_argument(
+        "--crop-duration",
+        type=float,
+        default=3.0,
+        help="Duration in seconds for each V3 reference crop (default: 3.0)",
+    )
+    g.add_argument(
         "--enable-timing-branch",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -351,6 +467,7 @@ def _add_fixed_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Directory containing .timing.pt sidecars aligned to the tensor dataset",
     )
+    g.add_argument("--strict-sidecars", action=argparse.BooleanOptionalAction, default=False, help="Require every dataset tensor to have a readable, non-empty timing sidecar")
     g.add_argument(
         "--timing-hidden-size",
         type=int,
@@ -380,6 +497,12 @@ def _add_fixed_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=0.1,
         help="Dropout inside the timing encoder (default: 0.1)",
+    )
+    g.add_argument(
+        "--timing-init-profile",
+        choices=["safe", "historical_v4", "suppressed_new"],
+        default="safe",
+        help="Fresh timing-branch initialization profile (default: safe)",
     )
     g.add_argument(
         "--timing-loss-weight",
@@ -460,6 +583,12 @@ def _add_fixed_args(parser: argparse.ArgumentParser) -> None:
         help="Enable phrase/global timing-state modulation on top of event timing attention (default: False)",
     )
     g.add_argument(
+        "--enable-absolute-time-conditioning",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Encode normalized absolute event starts/ends in timing tokens (default: False)",
+    )
+    g.add_argument(
         "--timing-global-condition-scale",
         type=float,
         default=1.0,
@@ -471,6 +600,9 @@ def _add_fixed_args(parser: argparse.ArgumentParser) -> None:
         default=8,
         help="Bottleneck width for phrase/global modulation (default: 8; smaller is safer on tiny datasets)",
     )
+    g.add_argument("--timing-encoder-learning-rate", type=float, default=0.0, help="Dedicated timing encoder/supervisor LR; 0 inherits base LR")
+    g.add_argument("--timing-gate-learning-rate", type=float, default=0.0, help="Dedicated FP32 timing gate LR; 0 inherits base LR")
+    g.add_argument("--timing-consumer-learning-rate", type=float, default=0.0, help="Dedicated timing cross-attention LR; 0 inherits base LR")
     g.add_argument(
         "--timing-train-last-n-layers",
         type=int,

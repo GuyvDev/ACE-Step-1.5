@@ -43,6 +43,8 @@ class ServiceGenerateMixin:
         audio_code_hints: Optional[Union[str, List[str]]] = None,
         infer_method: str = "ode",
         timesteps: Optional[List[float]] = None,
+        initial_noise: Optional[torch.Tensor] = None,  # PHASE_D_FIXED_LATENT_V1
+        require_initial_noise: bool = False,  # PHASE_D_FIXED_LATENT_V1
     ) -> Dict[str, Any]:
         """Generate music latents and metadata from text/audio conditioning inputs.
 
@@ -124,6 +126,8 @@ class ServiceGenerateMixin:
             cfg_interval_end=cfg_interval_end,
             shift=shift,
             timesteps=timesteps,
+            initial_noise=initial_noise,  # PHASE_D_FIXED_LATENT_V1
+            require_initial_noise=require_initial_noise,  # PHASE_D_FIXED_LATENT_V1
         )
         outputs, encoder_hidden_states, encoder_attention_mask, context_latents = (
             self._execute_service_generate_diffusion(

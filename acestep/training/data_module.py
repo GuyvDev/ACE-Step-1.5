@@ -45,7 +45,7 @@ class PreprocessedTensorDataset(Dataset):
     No VAE/text encoder needed during training - just load tensors directly!
     """
     
-    def __init__(self, tensor_dir: str, timing_dir: Optional[str] = None):
+    def __init__(self, tensor_dir: str, timing_dir: Optional[str] = None, identity_sidecar_dir: Optional[str] = None, strict_timing_sidecars: bool = False):
         """Initialize from a directory of preprocessed .pt files.
 
         Args:
@@ -53,6 +53,9 @@ class PreprocessedTensorDataset(Dataset):
             timing_dir: Optional directory containing .timing.pt sidecar files produced
                         by extract_timing_features.py (Phase D). When provided, timing
                         features are loaded and returned in each sample dict.
+            identity_sidecar_dir: Optional directory containing .identity.pt sidecars
+                        with frozen Phase B identity targets. This is separate from
+                        timing and does not enable the timing branch.
 
         Raises:
             ValueError: If tensor_dir is not an existing directory or escapes safe root.
@@ -63,6 +66,9 @@ class PreprocessedTensorDataset(Dataset):
         self.tensor_dir = validated_dir
         # Phase D: optional timing sidecar directory
         self.timing_dir: Optional[str] = timing_dir
+        self.strict_timing_sidecars = bool(strict_timing_sidecars)
+        # Phase B: optional frozen identity target sidecars.
+        self.identity_sidecar_dir: Optional[str] = identity_sidecar_dir
         self.sample_paths: List[str] = []
         
         # Load manifest if exists
@@ -96,6 +102,31 @@ class PreprocessedTensorDataset(Dataset):
             f"PreprocessedTensorDataset: {len(self.valid_paths)} samples "
             f"from {self.tensor_dir}"
         )
+        self.timing_sidecar_report = self._audit_timing_sidecars() if self.timing_dir else None
+
+    def _audit_timing_sidecars(self) -> Dict[str, Any]:
+        report: Dict[str, Any] = {"tensor_count": len(self.valid_paths), "valid": 0, "invalid": []}
+        for tensor_path in self.valid_paths:
+            stem = os.path.splitext(os.path.basename(tensor_path))[0]
+            parts = stem.rsplit("_", 1)
+            if len(parts) == 2 and len(parts[1]) >= 8 and all(c in "0123456789abcdef" for c in parts[1]):
+                stem = parts[0]
+            sidecar = os.path.join(str(self.timing_dir), f"{stem}.timing.pt")
+            try:
+                value = torch.load(sidecar, map_location="cpu", weights_only=False)
+                tokens = value.get("timing_tokens")
+                mask = value.get("timing_mask")
+                if not isinstance(tokens, torch.Tensor) or tokens.numel() == 0:
+                    raise ValueError("timing_tokens missing or empty")
+                if not isinstance(mask, torch.Tensor) or mask.numel() == 0 or not bool(mask.bool().any()):
+                    raise ValueError("timing_mask missing, empty, or all false")
+                report["valid"] += 1
+            except Exception as exc:
+                report["invalid"].append({"path": sidecar, "error": str(exc)})
+        report["coverage"] = report["valid"] / max(1, report["tensor_count"])
+        if self.strict_timing_sidecars and report["invalid"]:
+            raise RuntimeError(f"strict timing-sidecar audit failed: {report}")
+        return report
     
     def _resolve_manifest_path(self, raw: str) -> Optional[str]:
         """Resolve a single manifest sample path to a validated absolute path.
@@ -153,6 +184,7 @@ class PreprocessedTensorDataset(Dataset):
             "metadata": data.get("metadata", {}),
             "ref_voice_features": data.get("ref_voice_features"),
             "ref_voice_attention_mask": data.get("ref_voice_attention_mask"),
+            "ref_voice_crop_metadata": data.get("ref_voice_crop_metadata"),
             "text_hidden_states": data.get("text_hidden_states"),
             "text_attention_mask": data.get("text_attention_mask"),
             "lyric_hidden_states": data.get("lyric_hidden_states"),
@@ -177,18 +209,49 @@ class PreprocessedTensorDataset(Dataset):
             "timing_event_ends": None,
             "timing_audio_duration": None,
             "timing_metadata": None,
+            # Phase B identity-only sidecar targets (None if not configured).
+            "identity_wavlm_embedding": None,
+            "identity_ecapa_embedding": None,
+            "identity_spectral_formant": None,
+            "identity_pitch_style": None,
+            "identity_negative_wavlm_embeddings": None,
+            "identity_negative_ecapa_embeddings": None,
+            "identity_sidecar_metadata": None,
+            "identity_v5_prototype": None,
+            "identity_v5_negative_prototypes": None,
+            "identity_v5_negative_singer_ids": None,
         }
+
+        tensor_basename = os.path.splitext(os.path.basename(tensor_path))[0]
+        base_stem = tensor_basename
+        parts = tensor_basename.rsplit("_", 1)
+        if len(parts) == 2 and len(parts[1]) >= 8 and all(c in "0123456789abcdef" for c in parts[1]):
+            base_stem = parts[0]
+
+        # Phase B: load identity sidecar if identity_sidecar_dir is configured.
+        if self.identity_sidecar_dir is not None:
+            identity_path = os.path.join(self.identity_sidecar_dir, f"{tensor_basename}.identity.pt")
+            if not os.path.exists(identity_path):
+                identity_path = os.path.join(self.identity_sidecar_dir, f"{base_stem}.identity.pt")
+            if os.path.exists(identity_path):
+                try:
+                    idata = torch.load(identity_path, map_location="cpu", weights_only=False)
+                    sample["identity_wavlm_embedding"] = idata.get("wavlm_embedding")
+                    sample["identity_ecapa_embedding"] = idata.get("ecapa_embedding")
+                    sample["identity_spectral_formant"] = idata.get("spectral_formant_vector")
+                    sample["identity_pitch_style"] = idata.get("pitch_style_vector")
+                    sample["identity_negative_wavlm_embeddings"] = idata.get("negative_wavlm_embeddings")
+                    sample["identity_negative_ecapa_embeddings"] = idata.get("negative_ecapa_embeddings")
+                    sample["identity_sidecar_metadata"] = idata.get("metadata")
+                    sample["identity_v5_prototype"] = idata.get("v5_billy_prototype")
+                    sample["identity_v5_negative_prototypes"] = idata.get("v5_negative_prototypes")
+                    sample["identity_v5_negative_singer_ids"] = idata.get("v5_negative_singer_ids")
+                except Exception as e:
+                    logger.warning("Failed to load identity sidecar %s: %s", identity_path, e)
 
         # Phase D: load timing sidecar if timing_dir is configured
         if self.timing_dir is not None:
             # Derive sidecar filename from tensor filename
-            tensor_basename = os.path.splitext(os.path.basename(tensor_path))[0]
-            # Strip hash suffix (_xxxxxxxx) if present (8 hex chars after last _)
-            # e.g. 001_piano_man_s003_c40820d4be -> 001_piano_man_s003
-            base_stem = tensor_basename
-            parts = tensor_basename.rsplit("_", 1)
-            if len(parts) == 2 and len(parts[1]) >= 8 and all(c in "0123456789abcdef" for c in parts[1]):
-                base_stem = parts[0]
             timing_path = os.path.join(self.timing_dir, f"{base_stem}.timing.pt")
             if os.path.exists(timing_path):
                 try:
@@ -213,6 +276,8 @@ class PreprocessedTensorDataset(Dataset):
                     sample["timing_audio_duration"] = tdata.get("audio_duration_sec")
                     sample["timing_metadata"] = tdata.get("timing_metadata")
                 except Exception as e:
+                    if self.strict_timing_sidecars:
+                        raise RuntimeError(f"Failed to load timing sidecar {timing_path}: {e}") from e
                     logger.warning(
                         "Failed to load timing sidecar %s: %s", timing_path, e
                     )
@@ -260,6 +325,7 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     lyric_attention_masks_keep = []
     max_ref_len = 0
     ref_rank = None
+    ref_crops = None
     ref_layers = None
     ref_dim = None
     max_text_len_keep = 0
@@ -270,7 +336,13 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
             rvf = sample.get("ref_voice_features")
             if rvf is None:
                 continue
-            if rvf.ndim == 3:
+            if rvf.ndim == 4:
+                ref_rank = 4
+                ref_crops = rvf.shape[0]
+                ref_layers = rvf.shape[1]
+                max_ref_len = max(max_ref_len, rvf.shape[2])
+                ref_dim = rvf.shape[3]
+            elif rvf.ndim == 3:
                 ref_rank = 3
                 ref_layers = rvf.shape[0]
                 max_ref_len = max(max_ref_len, rvf.shape[1])
@@ -325,23 +397,39 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
             rvf = sample.get("ref_voice_features")
             rvm = sample.get("ref_voice_attention_mask")
             if rvf is None or rvm is None:
-                if ref_rank == 3:
+                if ref_rank == 4:
+                    rvf = torch.zeros(ref_crops, ref_layers, max_ref_len, ref_dim, dtype=ehs.dtype)
+                    rvm = torch.zeros(ref_crops, max_ref_len, dtype=eam.dtype)
+                elif ref_rank == 3:
                     rvf = torch.zeros(ref_layers, max_ref_len, ref_dim, dtype=ehs.dtype)
+                    rvm = torch.zeros(max_ref_len, dtype=eam.dtype)
                 else:
                     rvf = torch.zeros(max_ref_len, ref_dim, dtype=ehs.dtype)
-                rvm = torch.zeros(max_ref_len, dtype=eam.dtype)
+                    rvm = torch.zeros(max_ref_len, dtype=eam.dtype)
             else:
-                if ref_rank == 3:
+                if ref_rank == 4:
+                    if rvf.shape[0] != ref_crops or rvf.shape[1] != ref_layers:
+                        raise ValueError(f"Mismatched multi-crop MERT shape: {tuple(rvf.shape)}")
+                    if rvf.shape[2] < max_ref_len:
+                        pad = rvf.new_zeros(rvf.shape[0], rvf.shape[1], max_ref_len - rvf.shape[2], rvf.shape[3])
+                        rvf = torch.cat([rvf, pad], dim=2)
+                    if rvm.shape[-1] < max_ref_len:
+                        pad = rvm.new_zeros(rvm.shape[0], max_ref_len - rvm.shape[-1])
+                        rvm = torch.cat([rvm, pad], dim=-1)
+                elif ref_rank == 3:
                     if rvf.shape[1] < max_ref_len:
                         pad = rvf.new_zeros(rvf.shape[0], max_ref_len - rvf.shape[1], rvf.shape[2])
                         rvf = torch.cat([rvf, pad], dim=1)
+                    if rvm.shape[0] < max_ref_len:
+                        pad = rvm.new_zeros(max_ref_len - rvm.shape[0])
+                        rvm = torch.cat([rvm, pad], dim=0)
                 else:
                     if rvf.shape[0] < max_ref_len:
                         pad = rvf.new_zeros(max_ref_len - rvf.shape[0], rvf.shape[1])
                         rvf = torch.cat([rvf, pad], dim=0)
-                if rvm.shape[0] < max_ref_len:
-                    pad = rvm.new_zeros(max_ref_len - rvm.shape[0])
-                    rvm = torch.cat([rvm, pad], dim=0)
+                    if rvm.shape[0] < max_ref_len:
+                        pad = rvm.new_zeros(max_ref_len - rvm.shape[0])
+                        rvm = torch.cat([rvm, pad], dim=0)
             ref_voice_features.append(rvf)
             ref_voice_attention_masks.append(rvm)
 
@@ -381,11 +469,40 @@ def collate_preprocessed_batch(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     if any_ref_voice:
         output["ref_voice_features"] = torch.stack(ref_voice_features)
         output["ref_voice_attention_mask"] = torch.stack(ref_voice_attention_masks)
+        if any(s.get("ref_voice_crop_metadata") is not None for s in batch):
+            output["ref_voice_crop_metadata"] = [s.get("ref_voice_crop_metadata") for s in batch]
         if keep_text_lyric_inputs:
             output["text_hidden_states"] = torch.stack(text_hidden_states_keep)
             output["text_attention_mask"] = torch.stack(text_attention_masks_keep)
             output["lyric_hidden_states"] = torch.stack(lyric_hidden_states_keep)
             output["lyric_attention_mask"] = torch.stack(lyric_attention_masks_keep)
+
+    # Phase B: collate frozen identity target sidecars.
+    identity_keys = (
+        "identity_wavlm_embedding",
+        "identity_ecapa_embedding",
+        "identity_spectral_formant",
+        "identity_pitch_style",
+        "identity_negative_wavlm_embeddings",
+        "identity_negative_ecapa_embeddings",
+        "identity_v5_prototype",
+        "identity_v5_negative_prototypes",
+    )
+    for key in identity_keys:
+        first = next((s.get(key) for s in batch if s.get(key) is not None), None)
+        if first is None:
+            continue
+        stacked = []
+        for sample in batch:
+            value = sample.get(key)
+            if value is None:
+                value = torch.zeros_like(first)
+            stacked.append(value.to(torch.float32))
+        output[key] = torch.stack(stacked)
+    if any(s.get("identity_sidecar_metadata") is not None for s in batch):
+        output["identity_sidecar_metadata"] = [s.get("identity_sidecar_metadata") for s in batch]
+    if any(s.get("identity_v5_negative_singer_ids") is not None for s in batch):
+        output["identity_v5_negative_singer_ids"] = [s.get("identity_v5_negative_singer_ids") for s in batch]
 
     # Phase E: collate timing, predictor, and expressivity sidecars.
     def _first_non_none(key: str):
@@ -570,6 +687,8 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         pin_memory_device: str = "",
         val_split: float = 0.0,
         timing_dir: Optional[str] = None,
+        identity_sidecar_dir: Optional[str] = None,
+        strict_timing_sidecars: bool = False,
     ):
         """Initialize the data module.
 
@@ -578,6 +697,7 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
             batch_size: Training batch size
             num_workers: Number of data loading workers
             timing_dir: Optional directory with .timing.pt sidecars (Phase D)
+            identity_sidecar_dir: Optional directory with .identity.pt sidecars (Phase B)
             pin_memory: Whether to pin memory for faster GPU transfer
             val_split: Fraction of data for validation (0 = no validation)
         """
@@ -593,6 +713,8 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
         self.pin_memory_device = pin_memory_device
         self.val_split = val_split
         self.timing_dir = timing_dir  # Phase D
+        self.identity_sidecar_dir = identity_sidecar_dir  # Phase B identity-only
+        self.strict_timing_sidecars = bool(strict_timing_sidecars)
 
         self.train_dataset = None
         self.val_dataset = None
@@ -600,8 +722,13 @@ class PreprocessedDataModule(LightningDataModule if LIGHTNING_AVAILABLE else obj
     def setup(self, stage: Optional[str] = None):
         """Setup datasets."""
         if stage == 'fit' or stage is None:
-            # Create full dataset (Phase D: pass timing_dir)
-            full_dataset = PreprocessedTensorDataset(self.tensor_dir, timing_dir=self.timing_dir)
+            # Create full dataset. Identity sidecars are independent of Phase D timing.
+            full_dataset = PreprocessedTensorDataset(
+                self.tensor_dir,
+                timing_dir=self.timing_dir,
+                identity_sidecar_dir=self.identity_sidecar_dir,
+                strict_timing_sidecars=self.strict_timing_sidecars,
+            )
             
             # Split if validation requested
             if self.val_split > 0 and len(full_dataset) > 1:

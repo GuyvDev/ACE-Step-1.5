@@ -162,6 +162,127 @@ class FrozenMERTFeatureExtractor:
         )
 
 
+
+
+
+def _frame_rms(x: torch.Tensor, sample_rate: int, win_sec: float = 0.20, hop_sec: float = 0.10) -> tuple[torch.Tensor, torch.Tensor]:
+    win = max(1, int(round(sample_rate * win_sec)))
+    hop = max(1, int(round(sample_rate * hop_sec)))
+    if x.numel() < win:
+        x = torch.nn.functional.pad(x, (0, win - x.numel()))
+    frames = x.unfold(0, win, hop)
+    rms = torch.sqrt(torch.mean(frames.float() ** 2, dim=-1) + 1e-12)
+    times = torch.arange(frames.shape[0], dtype=torch.float32) * hop_sec
+    return rms, times
+
+
+def _estimate_frame_f0(x: torch.Tensor, sample_rate: int, win_sec: float = 0.08, hop_sec: float = 0.04) -> tuple[torch.Tensor, torch.Tensor]:
+    win = max(1, int(round(sample_rate * win_sec)))
+    hop = max(1, int(round(sample_rate * hop_sec)))
+    if x.numel() < win:
+        x = torch.nn.functional.pad(x, (0, win - x.numel()))
+    frames = x.unfold(0, win, hop).float()
+    min_lag = max(1, int(sample_rate / 450.0))
+    max_lag = max(min_lag + 1, int(sample_rate / 70.0))
+    f0 = torch.full((frames.shape[0],), float("nan"), dtype=torch.float32)
+    for idx, fr in enumerate(frames):
+        if torch.sqrt(torch.mean(fr * fr) + 1e-12) < 0.008:
+            continue
+        fr = fr - fr.mean()
+        ac = torch.nn.functional.conv1d(
+            fr.view(1, 1, -1),
+            fr.flip(0).view(1, 1, -1),
+            padding=fr.numel() - 1,
+        ).view(-1)[fr.numel() - 1 :]
+        if ac.numel() <= max_lag or float(ac[0]) <= 1e-9:
+            continue
+        ac = ac / (ac[0] + 1e-12)
+        seg = ac[min_lag:max_lag]
+        if seg.numel() == 0:
+            continue
+        lag = int(torch.argmax(seg).item()) + min_lag
+        if float(ac[lag]) >= 0.25:
+            f0[idx] = float(sample_rate / lag)
+    times = torch.arange(frames.shape[0], dtype=torch.float32) * hop_sec
+    return f0, times
+
+
+def select_reference_crop_starts(
+    audio_path: str | Path,
+    *,
+    crop_duration_sec: float = 3.0,
+    top_k: int = 3,
+    base_start_sec: float = 0.0,
+) -> list[dict[str, float | str]]:
+    """Select deterministic V3 reference crops from existing audio only."""
+    top_k = max(1, int(top_k))
+    crop_duration_sec = max(0.25, float(crop_duration_sec))
+    wav = load_audio_clip_mono_16k(audio_path, start_sec=0.0, duration_sec=0.0)
+    sr = 16000
+    total_sec = max(crop_duration_sec, float(wav.numel()) / sr)
+    latest = max(0.0, total_sec - crop_duration_sec)
+    base = min(max(0.0, float(base_start_sec)), latest)
+
+    def clamp_start(v: float) -> float:
+        return float(min(max(0.0, v), latest))
+
+    rms, rms_times = _frame_rms(wav, sr)
+    f0, f0_times = _estimate_frame_f0(wav, sr)
+    voiced = torch.isfinite(f0)
+    starts: list[dict[str, float | str]] = [
+        {"label": "phrase_beginning", "start_sec": clamp_start(base)},
+        {"label": "phrase_ending", "start_sec": clamp_start(latest)},
+    ]
+    if rms.numel() > 0:
+        sustained_idx = int(torch.argmax(rms).item())
+        starts.append({
+            "label": "sustained_vowel",
+            "start_sec": clamp_start(float(rms_times[sustained_idx]) - crop_duration_sec / 2.0),
+        })
+    if bool(voiced.any()):
+        finite_f0 = f0[voiced]
+        finite_times = f0_times[voiced]
+        starts.append({
+            "label": "low_register",
+            "start_sec": clamp_start(float(finite_times[int(torch.argmin(finite_f0).item())]) - crop_duration_sec / 2.0),
+        })
+        starts.append({
+            "label": "high_register",
+            "start_sec": clamp_start(float(finite_times[int(torch.argmax(finite_f0).item())]) - crop_duration_sec / 2.0),
+        })
+
+    deduped: list[dict[str, float | str]] = []
+    seen: set[int] = set()
+    for item in starts:
+        bucket = int(round(float(item["start_sec"]) * 10.0))
+        if bucket in seen:
+            continue
+        seen.add(bucket)
+        deduped.append(item)
+        if len(deduped) >= top_k:
+            break
+    while len(deduped) < top_k:
+        frac = len(deduped) / max(top_k - 1, 1)
+        deduped.append({"label": f"fallback_{len(deduped)}", "start_sec": clamp_start(frac * latest)})
+    return deduped[:top_k]
+
+
+def pad_and_stack_mert_crops(crops: list[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tensor, torch.Tensor]:
+    if not crops:
+        raise ValueError("No MERT crops to stack")
+    max_t = max(int(features.shape[-2]) for features, _mask in crops)
+    padded_features = []
+    padded_masks = []
+    for features, mask in crops:
+        if features.shape[-2] < max_t:
+            pad_t = max_t - features.shape[-2]
+            features = torch.nn.functional.pad(features, (0, 0, 0, pad_t))
+            mask = torch.nn.functional.pad(mask, (0, pad_t))
+        padded_features.append(features)
+        padded_masks.append(mask)
+    return torch.stack(padded_features, dim=0), torch.stack(padded_masks, dim=0)
+
+
 class PrecomputedMERTConditioner(nn.Module):
     """Trainable aggregation/projection head for precomputed MERT features."""
 
@@ -174,6 +295,8 @@ class PrecomputedMERTConditioner(nn.Module):
         dropout: float = 0.1,
         scale: float = 1.0,
         use_layer_aggregation: bool = True,
+        max_reference_crops: int = 5,
+        use_crop_attention: bool = True,
     ) -> None:
         super().__init__()
         resolved_hidden = int(hidden_size or input_dim)
@@ -183,11 +306,17 @@ class PrecomputedMERTConditioner(nn.Module):
         self.hidden_size = resolved_hidden
         self.scale = float(scale)
         self.use_layer_aggregation = bool(use_layer_aggregation)
+        self.max_reference_crops = max(1, int(max_reference_crops))
+        self.use_crop_attention = bool(use_crop_attention)
         self.dropout = nn.Dropout(float(dropout))
         if self.use_layer_aggregation:
             self.layer_logits = nn.Parameter(torch.zeros(self.num_layers, dtype=torch.float32))
         else:
             self.register_parameter("layer_logits", None)
+        if self.use_crop_attention:
+            self.crop_logits = nn.Parameter(torch.zeros(self.max_reference_crops, dtype=torch.float32))
+        else:
+            self.register_parameter("crop_logits", None)
         self.proj = nn.Linear(self.hidden_size, self.output_dim, bias=True)
 
     def forward(
@@ -199,15 +328,56 @@ class PrecomputedMERTConditioner(nn.Module):
         """Project precomputed MERT features into ACE conditioning space.
 
         Args:
-            ref_voice_features: [B, layers, T, H] or [B, T, H]
-            ref_voice_attention_mask: [B, T]
+            ref_voice_features: [B, crops, layers, T, H], [B, layers, T, H] or [B, T, H]
+            ref_voice_attention_mask: [B, crops, T] or [B, T]
         """
-        if ref_voice_features.ndim not in (3, 4):
+        if ref_voice_features.ndim not in (3, 4, 5):
             raise ValueError(
-                "Expected ref_voice_features with shape [B, L, T, H] or [B, T, H], "
+                "Expected ref_voice_features with shape [B, C, L, T, H], [B, L, T, H] or [B, T, H], "
                 f"got {tuple(ref_voice_features.shape)}"
             )
-        if ref_voice_features.ndim == 4:
+        if ref_voice_features.ndim == 5:
+            _bsz, crops, layers, _time, hidden = ref_voice_features.shape
+            if crops > self.max_reference_crops:
+                raise ValueError(f"Expected at most {self.max_reference_crops} crops, got {crops}")
+            if layers != self.num_layers:
+                raise ValueError(f"Expected {self.num_layers} MERT layers, got {layers}")
+            if hidden != self.hidden_size:
+                raise ValueError(f"Expected hidden size {self.hidden_size}, got {hidden}")
+            if self.use_layer_aggregation and self.layer_logits is not None:
+                layer_weights = torch.softmax(self.layer_logits.to(ref_voice_features.device), dim=0)
+                layer_weights = layer_weights.view(1, 1, self.num_layers, 1, 1).to(ref_voice_features.dtype)
+                merged = (ref_voice_features * layer_weights).sum(dim=2)
+            else:
+                merged = ref_voice_features.mean(dim=2)
+            if ref_voice_attention_mask.ndim != 3:
+                raise ValueError(
+                    "Expected crop-aware ref_voice_attention_mask with shape [B, C, T], "
+                    f"got {tuple(ref_voice_attention_mask.shape)}"
+                )
+            conditioned_crops = self.proj(merged)
+            if self.use_crop_attention:
+                # V4: expose all crop frames as a reference-token bank. The DiT
+                # cross-attention can then select useful timbre fragments per
+                # generation state instead of averaging unaligned crop timelines.
+                conditioned = conditioned_crops.reshape(
+                    conditioned_crops.shape[0],
+                    conditioned_crops.shape[1] * conditioned_crops.shape[2],
+                    conditioned_crops.shape[3],
+                )
+                ref_voice_attention_mask = ref_voice_attention_mask.reshape(
+                    ref_voice_attention_mask.shape[0],
+                    ref_voice_attention_mask.shape[1] * ref_voice_attention_mask.shape[2],
+                )
+            elif self.crop_logits is not None:
+                crop_weights = torch.softmax(self.crop_logits[:crops].to(ref_voice_features.device), dim=0)
+                crop_weights = crop_weights.view(1, crops, 1, 1).to(conditioned_crops.dtype)
+                conditioned = (conditioned_crops * crop_weights).sum(dim=1)
+                ref_voice_attention_mask = ref_voice_attention_mask.amax(dim=1)
+            else:
+                conditioned = conditioned_crops.mean(dim=1)
+                ref_voice_attention_mask = ref_voice_attention_mask.amax(dim=1)
+        elif ref_voice_features.ndim == 4:
             _bsz, layers, _time, hidden = ref_voice_features.shape
             if layers != self.num_layers:
                 raise ValueError(f"Expected {self.num_layers} MERT layers, got {layers}")
@@ -225,7 +395,8 @@ class PrecomputedMERTConditioner(nn.Module):
                 raise ValueError(f"Expected hidden size {self.hidden_size}, got {hidden}")
             merged = ref_voice_features
 
-        conditioned = self.proj(merged)
+        if ref_voice_features.ndim != 5:
+            conditioned = self.proj(merged)
         conditioned = self.dropout(conditioned)
         applied_scale = self.scale if scale is None else float(scale)
         conditioned = conditioned * applied_scale
@@ -240,6 +411,8 @@ class PrecomputedMERTConditioner(nn.Module):
             "dropout": float(self.dropout.p),
             "scale": self.scale,
             "use_layer_aggregation": self.use_layer_aggregation,
+            "max_reference_crops": self.max_reference_crops,
+            "use_crop_attention": self.use_crop_attention,
         }
 
 

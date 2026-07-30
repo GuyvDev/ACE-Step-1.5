@@ -335,12 +335,17 @@ def load_training_checkpoint(
                     logger.warning(f"Failed to load optimizer state: {e}")
 
             if scheduler is not None and "scheduler_state_dict" in training_state:
-                try:
-                    scheduler.load_state_dict(training_state["scheduler_state_dict"])
-                    result["loaded_scheduler"] = True
-                    logger.info("Loaded scheduler state from checkpoint")
-                except (RuntimeError, ValueError, KeyError) as e:
-                    logger.warning(f"Failed to load scheduler state: {e}")
+                if optimizer is not None and not result["loaded_optimizer"]:
+                    logger.warning(
+                        "Skipping scheduler state because optimizer parameter groups were incompatible"
+                    )
+                else:
+                    try:
+                        scheduler.load_state_dict(training_state["scheduler_state_dict"])
+                        result["loaded_scheduler"] = True
+                        logger.info("Loaded scheduler state from checkpoint")
+                    except (RuntimeError, ValueError, KeyError) as e:
+                        logger.warning(f"Failed to load scheduler state: {e}")
 
             logger.info(
                 f"Loaded checkpoint metadata from epoch {result['epoch']}, step {result['global_step']}"

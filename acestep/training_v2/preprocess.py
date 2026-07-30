@@ -36,7 +36,11 @@ from acestep.training_v2.preprocess_vae import (
     TARGET_SR as _TARGET_SR,
     tiled_vae_encode as _tiled_vae_encode,
 )
-from acestep.training_v2.mert_conditioning import FrozenMERTFeatureExtractor
+from acestep.training_v2.mert_conditioning import (
+    FrozenMERTFeatureExtractor,
+    pad_and_stack_mert_crops,
+    select_reference_crop_starts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +319,7 @@ def _pass1_light(
 
                 ref_voice_hidden_states = None
                 ref_voice_attention_mask = None
+                ref_voice_crop_metadata = None
                 ref_voice_audio_path = sm.get("ref_voice_audio_path")
                 if ref_voice_audio_path and mert_extractor is not None:
                     ref_start = float(sm.get("ref_voice_start_sec", 0.0) or 0.0)
@@ -325,12 +330,43 @@ def _pass1_light(
                         )
                         or ds_meta.get("max_ref_voice_duration", 3.0)
                     )
+                    use_multicrop = bool(ds_meta.get("use_multicrop_mert_conditioning", False))
+                    crop_duration = float(ds_meta.get("crop_duration", ref_duration) or ref_duration)
+                    top_k_crops = int(ds_meta.get("top_k_reference_crops", 3) or 3)
                     try:
-                        ref_voice_hidden_states, ref_voice_attention_mask = mert_extractor.extract_from_file(
-                            str(ref_voice_audio_path),
-                            start_sec=ref_start,
-                            duration_sec=ref_duration,
-                        )
+                        if use_multicrop:
+                            crop_specs = select_reference_crop_starts(
+                                str(ref_voice_audio_path),
+                                crop_duration_sec=crop_duration,
+                                top_k=top_k_crops,
+                                base_start_sec=ref_start,
+                            )
+                            crop_tensors = []
+                            for crop in crop_specs:
+                                features, mask = mert_extractor.extract_from_file(
+                                    str(ref_voice_audio_path),
+                                    start_sec=float(crop["start_sec"]),
+                                    duration_sec=crop_duration,
+                                )
+                                crop_tensors.append((features, mask))
+                            ref_voice_hidden_states, ref_voice_attention_mask = pad_and_stack_mert_crops(crop_tensors)
+                            ref_voice_crop_metadata = {
+                                "mode": "multi_crop",
+                                "top_k_reference_crops": top_k_crops,
+                                "crop_duration": crop_duration,
+                                "crops": crop_specs,
+                            }
+                        else:
+                            ref_voice_hidden_states, ref_voice_attention_mask = mert_extractor.extract_from_file(
+                                str(ref_voice_audio_path),
+                                start_sec=ref_start,
+                                duration_sec=ref_duration,
+                            )
+                            ref_voice_crop_metadata = {
+                                "mode": "single_crop",
+                                "crops": [{"label": "single_reference", "start_sec": ref_start}],
+                                "crop_duration": ref_duration,
+                            }
                     except Exception as exc:
                         logger.warning(
                             "[Side-Step] Failed to extract MERT features for %s: %s",
@@ -366,18 +402,25 @@ def _pass1_light(
                         "ref_voice_audio_path": sm.get("ref_voice_audio_path"),
                         "ref_voice_start_sec": sm.get("ref_voice_start_sec"),
                         "ref_voice_duration_sec": sm.get("ref_voice_duration_sec"),
+                        "ref_voice_crop_metadata": ref_voice_crop_metadata,
+                        "target_song_id": sm.get("target_song_id"),
+                        "reference_song_id": sm.get("reference_song_id"),
+                        "target_audio_sha256": sm.get("target_audio_sha256"),
+                        "reference_audio_sha256": sm.get("reference_audio_sha256"),
+                        "identity_v5_prototype_key": sm.get("identity_v5_prototype_key"),
                     },
                 }
                 if ref_voice_hidden_states is not None and ref_voice_attention_mask is not None:
                     payload["ref_voice_features"] = ref_voice_hidden_states.cpu()
                     payload["ref_voice_attention_mask"] = ref_voice_attention_mask.cpu()
+                    payload["ref_voice_crop_metadata"] = ref_voice_crop_metadata
 
                 torch.save(payload, tmp_path)
 
                 # Free GPU tensors from this iteration before the next one
                 del target_latents, attention_mask, text_hs, text_mask
                 del lyric_hs, lyric_mask
-                del ref_voice_hidden_states, ref_voice_attention_mask
+                del ref_voice_hidden_states, ref_voice_attention_mask, ref_voice_crop_metadata
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -513,6 +556,7 @@ def _pass2_heavy(
                 if "ref_voice_features" in data and "ref_voice_attention_mask" in data:
                     final_payload["ref_voice_features"] = data["ref_voice_features"]
                     final_payload["ref_voice_attention_mask"] = data["ref_voice_attention_mask"]
+                    final_payload["ref_voice_crop_metadata"] = data.get("ref_voice_crop_metadata")
                     final_payload["text_hidden_states"] = data["text_hidden_states"]
                     final_payload["text_attention_mask"] = data["text_attention_mask"]
                     final_payload["lyric_hidden_states"] = data["lyric_hidden_states"]

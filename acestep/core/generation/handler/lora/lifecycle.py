@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from typing import Any
 
 from loguru import logger
@@ -156,9 +157,10 @@ def _load_lokr_adapter(decoder: Any, weights_path: str) -> Any:
 
 
 def _default_adapter_name_from_path(lora_path: str) -> str:
-    """Derive a default adapter name from path (e.g. 'final' from './lora/final')."""
-    name = os.path.basename(lora_path.rstrip(os.sep))
-    return name if name else "default"
+    """Derive a deterministic PyTorch-safe adapter name from a checkpoint path."""
+    raw_name = os.path.basename(lora_path.rstrip(os.sep)) or "default"
+    name = re.sub(r"[^0-9A-Za-z_-]+", "_", raw_name).strip("_")
+    return name or "default"
 
 
 def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:

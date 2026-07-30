@@ -40,23 +40,36 @@ def _safe_enable_input_require_grads(self):
             )
         return result
     except NotImplementedError:
+        def _require_hidden_state_grads(module, args, kwargs):
+            hidden_states = kwargs.get("hidden_states")
+            if hidden_states is None:
+                if not args:
+                    raise RuntimeError(
+                        "DiT input-gradient hook did not receive hidden_states"
+                    )
+                hidden_states = args[0]
+                if not hidden_states.requires_grad:
+                    args = (hidden_states.requires_grad_(True), *args[1:])
+                return args, kwargs
+            if not hidden_states.requires_grad:
+                kwargs["hidden_states"] = hidden_states.requires_grad_(True)
+            return args, kwargs
+
         try:
-            self._acestep_input_grads_hook_enabled = False
-        except Exception:
-            logger.debug(
-                "Failed to set _acestep_input_grads_hook_enabled", exc_info=True
-            )
-        if not getattr(self, "_acestep_input_grads_warning_emitted", False):
-            logger.info(
-                "Skipping enable_input_require_grads for decoder: "
-                "get_input_embeddings is not implemented (expected for DiT)"
-            )
-            try:
-                self._acestep_input_grads_warning_emitted = True
-            except Exception:
-                logger.debug(
-                    "Failed to set _acestep_input_grads_warning_emitted", exc_info=True
+            existing_hook = getattr(self, "_require_grads_hook", None)
+            if existing_hook is None:
+                self._require_grads_hook = self.register_forward_pre_hook(
+                    _require_hidden_state_grads,
+                    with_kwargs=True,
                 )
+            self._acestep_input_grads_hook_enabled = True
+        except Exception:
+            self._acestep_input_grads_hook_enabled = False
+            raise
+        logger.info(
+            "Enabled DiT hidden_states input-gradient hook because "
+            "get_input_embeddings is not implemented"
+        )
         return None
 
 

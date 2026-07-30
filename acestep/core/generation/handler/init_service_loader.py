@@ -32,21 +32,31 @@ class InitServiceLoaderMixin:
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
-        if use_flash_attention and self.is_flash_attention_available(device):
-            attn_implementation = "flash_attention_2"
-        else:
-            if use_flash_attention:
-                logger.warning(
-                    f"[initialize_service] Flash attention requested but unavailable for device={device}. "
-                    "Falling back to SDPA."
+        strict_attn = os.environ.get("PHASE_D_STRICT_ATTN_IMPLEMENTATION", "").strip()
+        if strict_attn:
+            if strict_attn != "sdpa":
+                raise RuntimeError(
+                    f"controlled Phase-D supports exactly PHASE_D_STRICT_ATTN_IMPLEMENTATION=sdpa, got {strict_attn!r}"
                 )
-            attn_implementation = "sdpa"
-
-        attn_candidates = [attn_implementation]
-        if "sdpa" not in attn_candidates:
-            attn_candidates.append("sdpa")
-        if "eager" not in attn_candidates:
-            attn_candidates.append("eager")
+            if use_flash_attention:
+                raise RuntimeError("strict SDPA mode requires use_flash_attention=False")
+            attn_implementation = strict_attn  # PHASE_D_FIXED_LATENT_V1
+            attn_candidates = [strict_attn]
+        else:
+            if use_flash_attention and self.is_flash_attention_available(device):
+                attn_implementation = "flash_attention_2"
+            else:
+                if use_flash_attention:
+                    logger.warning(
+                        f"[initialize_service] Flash attention requested but unavailable for device={device}. "
+                        "Falling back to SDPA."
+                    )
+                attn_implementation = "sdpa"
+            attn_candidates = [attn_implementation]
+            if "sdpa" not in attn_candidates:
+                attn_candidates.append("sdpa")
+            if "eager" not in attn_candidates:
+                attn_candidates.append("eager")
 
         last_attn_error = None
         self.model = None

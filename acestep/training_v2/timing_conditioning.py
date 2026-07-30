@@ -359,6 +359,104 @@ def build_timing_tokens(
 
 
 # ---------------------------------------------------------------------------
+# Generator-coupled local timing helpers
+# ---------------------------------------------------------------------------
+
+
+def build_local_timing_attention_mask(
+    *,
+    event_starts_sec: torch.Tensor,
+    event_ends_sec: torch.Tensor,
+    audio_durations_sec: torch.Tensor,
+    timing_mask: torch.Tensor,
+    query_len: int,
+    dtype: torch.dtype,
+    sigma_sec: float,
+    window_sec: float,
+    shift_sec: float = 0.0,
+) -> torch.Tensor:
+    """Build a fail-closed monotonic query-to-event additive attention mask.
+
+    Every latent query is anchored to its absolute position in the song. Events
+    inside ``window_sec`` receive a Gaussian distance bias, while all other
+    events are masked. If a genuine gap contains no event in the window, the
+    nearest valid event remains visible so SDPA never receives an all-masked row.
+    """
+    if query_len <= 0:
+        raise ValueError(f"query_len must be positive, got {query_len}")
+    if sigma_sec <= 0.0 or window_sec <= 0.0:
+        raise ValueError(
+            f"local timing sigma/window must be positive, got {sigma_sec}/{window_sec}"
+        )
+    if event_starts_sec.ndim != 2 or event_ends_sec.shape != event_starts_sec.shape:
+        raise ValueError("event starts/ends must have identical [B, N] shapes")
+    if timing_mask.shape != event_starts_sec.shape:
+        raise ValueError("timing mask must match event starts/ends")
+    batch, events = event_starts_sec.shape
+    durations = audio_durations_sec.reshape(batch, 1, 1).float()
+    if not bool(torch.isfinite(durations).all()) or bool((durations <= 0).any()):
+        raise ValueError("audio durations must be finite and positive")
+
+    starts = event_starts_sec.float().unsqueeze(1) + float(shift_sec)
+    ends = event_ends_sec.float().unsqueeze(1) + float(shift_sec)
+    valid = timing_mask.bool().unsqueeze(1)
+    valid = valid & torch.isfinite(starts) & torch.isfinite(ends) & (ends >= starts)
+    if not bool(valid.reshape(batch, -1).any(dim=1).all()):
+        raise ValueError("every sample must contain at least one valid timing event")
+
+    query_fraction = (
+        (torch.arange(query_len, device=starts.device, dtype=torch.float32) + 0.5)
+        / float(query_len)
+    )
+    query_time = query_fraction.view(1, query_len, 1) * durations
+    distance = torch.maximum(starts - query_time, query_time - ends).clamp_min(0.0)
+    gaussian = -0.5 * torch.square(distance / float(sigma_sec))
+    allowed = valid & (distance <= float(window_sec))
+
+    # Keep the nearest valid event visible in real pauses and at song edges.
+    nearest_distance = distance.masked_fill(~valid, float("inf"))
+    nearest_index = nearest_distance.argmin(dim=-1, keepdim=True)
+    has_local = allowed.any(dim=-1, keepdim=True)
+    nearest = torch.zeros_like(allowed).scatter_(-1, nearest_index, True)
+    allowed = allowed | (nearest & ~has_local)
+
+    minimum = torch.finfo(dtype).min
+    additive = gaussian.to(dtype=dtype).masked_fill(~allowed, minimum)
+    if additive.shape != (batch, query_len, events):
+        raise RuntimeError(f"local timing mask shape mismatch: {tuple(additive.shape)}")
+    if bool(torch.all(additive == minimum, dim=-1).any()):
+        raise RuntimeError("local timing mask contains an all-masked query")
+    return additive.unsqueeze(1)
+
+
+def build_event_frame_weights(
+    *,
+    event_starts_sec: torch.Tensor,
+    event_ends_sec: torch.Tensor,
+    audio_durations_sec: torch.Tensor,
+    timing_mask: torch.Tensor,
+    query_len: int,
+    extra_weight: float,
+    margin_sec: float,
+) -> torch.Tensor:
+    """Return normalized [B, T] weights emphasizing aligned lyric frames."""
+    if extra_weight < 0.0 or margin_sec < 0.0:
+        raise ValueError("event flow weight and margin must be non-negative")
+    batch = event_starts_sec.shape[0]
+    durations = audio_durations_sec.reshape(batch, 1, 1).float()
+    query_time = (
+        (torch.arange(query_len, device=event_starts_sec.device, dtype=torch.float32) + 0.5)
+        / float(query_len)
+    ).view(1, query_len, 1) * durations
+    starts = event_starts_sec.float().unsqueeze(1) - float(margin_sec)
+    ends = event_ends_sec.float().unsqueeze(1) + float(margin_sec)
+    valid = timing_mask.bool().unsqueeze(1)
+    covered = (valid & (query_time >= starts) & (query_time <= ends)).any(dim=-1)
+    weights = 1.0 + float(extra_weight) * covered.float()
+    return weights / weights.mean(dim=1, keepdim=True).clamp_min(1e-6)
+
+
+# ---------------------------------------------------------------------------
 # TimingEncoder
 # ---------------------------------------------------------------------------
 
@@ -383,7 +481,10 @@ class TimingEncoderConfig:
     global_feature_dim: int = len(GLOBAL_FEATURE_NAMES)
     enable_phrase_features: bool = True
     enable_phrase_modulation: bool = False
+    enable_absolute_time_conditioning: bool = False
+    absolute_time_num_frequencies: int = 4
     global_condition_scale: float = 1.0
+    init_profile: str = "safe"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -410,11 +511,17 @@ class TimingEncoderConfig:
         if "global_feature_dim" not in normalized:
             normalized["global_feature_dim"] = len(GLOBAL_FEATURE_NAMES)
         if "enable_phrase_features" not in normalized:
-            normalized["enable_phrase_features"] = True
+            normalized["enable_phrase_features"] = any(
+                key in d for key in ("phrase_feature_names", "phrase_feature_dim")
+            )
+        normalized.setdefault("enable_absolute_time_conditioning", False)
+        normalized.setdefault("absolute_time_num_frequencies", 4)
         if "enable_phrase_modulation" not in normalized:
             normalized["enable_phrase_modulation"] = False
         if "global_condition_scale" not in normalized:
             normalized["global_condition_scale"] = 1.0
+        if "init_profile" not in normalized:
+            normalized["init_profile"] = "safe"
         return cls(**{k: v for k, v in normalized.items() if k in cls.__dataclass_fields__})
 
 
@@ -424,6 +531,8 @@ class TimingEncoder(nn.Module):
     def __init__(self, config: TimingEncoderConfig) -> None:
         super().__init__()
         self.config = config
+        if config.init_profile not in {"safe", "historical_v4", "suppressed_new"}:
+            raise ValueError(f"Unsupported timing init profile: {config.init_profile}")
         H = config.hidden_size
 
         self.feature_embeddings = nn.ModuleList(
@@ -457,6 +566,21 @@ class TimingEncoder(nn.Module):
             if self.phrase_feature_proj is not None
             else None
         )
+        absolute_feature_dim = 4 + 4 * max(0, config.absolute_time_num_frequencies)
+        self.absolute_time_proj = (
+            nn.Sequential(
+                nn.Linear(absolute_feature_dim, H),
+                nn.SiLU(),
+                nn.LayerNorm(H),
+            )
+            if config.enable_absolute_time_conditioning
+            else None
+        )
+        self.absolute_time_gate = (
+            nn.Parameter(torch.tensor(0.0))
+            if self.absolute_time_proj is not None
+            else None
+        )
         self.global_summary_proj = (
             nn.Sequential(
                 nn.Linear(H, config.output_dim),
@@ -480,11 +604,13 @@ class TimingEncoder(nn.Module):
             if config.use_stream_type_embedding
             else None
         )
-        # Start both timing streams near-off so fresh-base training can
-        # introduce performance conditioning gradually instead of injecting
-        # half-strength random timing states on step 0.
-        self.output_gate = nn.Parameter(torch.tensor(-8.0))
-        self.global_gate = nn.Parameter(torch.tensor(-8.0))
+        gate_init = 0.0 if config.init_profile == "historical_v4" else -8.0
+        self.output_gate = nn.Parameter(torch.tensor(gate_init))
+        self.global_gate = (
+            nn.Parameter(torch.tensor(gate_init))
+            if config.enable_phrase_modulation or config.init_profile in {"safe", "suppressed_new"}
+            else None
+        )
 
         self.prediction_head = TimingPredictionHead(H)
 
@@ -493,11 +619,20 @@ class TimingEncoder(nn.Module):
     def _init_weights(self) -> None:
         for emb in list(self.feature_embeddings) + [self.feature_type_embeddings, self.pos_emb]:
             nn.init.normal_(emb.weight, std=0.02)
-        nn.init.zeros_(self.proj.weight)
+        if self.config.init_profile == "historical_v4":
+            nn.init.xavier_uniform_(self.proj.weight)
+        else:
+            nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
         if self.phrase_feature_proj is not None:
-            nn.init.zeros_(self.phrase_feature_proj[0].weight)
+            if self.config.init_profile == "historical_v4":
+                nn.init.xavier_uniform_(self.phrase_feature_proj[0].weight)
+            else:
+                nn.init.zeros_(self.phrase_feature_proj[0].weight)
             nn.init.zeros_(self.phrase_feature_proj[0].bias)
+        if self.absolute_time_proj is not None:
+            nn.init.xavier_uniform_(self.absolute_time_proj[0].weight)
+            nn.init.zeros_(self.absolute_time_proj[0].bias)
         if self.global_summary_proj is not None:
             nn.init.xavier_uniform_(self.global_summary_proj[0].weight)
             nn.init.zeros_(self.global_summary_proj[0].bias)
@@ -505,7 +640,10 @@ class TimingEncoder(nn.Module):
             nn.init.xavier_uniform_(self.global_feature_proj[0].weight)
             nn.init.zeros_(self.global_feature_proj[0].bias)
         if self.stream_type_embedding is not None:
-            nn.init.zeros_(self.stream_type_embedding)
+            if self.config.init_profile == "historical_v4":
+                nn.init.normal_(self.stream_type_embedding, std=0.02)
+            else:
+                nn.init.zeros_(self.stream_type_embedding)
         self.prediction_head.reset_parameters()
 
     @staticmethod
@@ -521,6 +659,9 @@ class TimingEncoder(nn.Module):
         timing_mask: Optional[torch.Tensor] = None,
         phrase_features: Optional[torch.Tensor] = None,
         global_features: Optional[torch.Tensor] = None,
+        event_starts_sec: Optional[torch.Tensor] = None,
+        event_ends_sec: Optional[torch.Tensor] = None,
+        audio_durations_sec: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         if timing_tokens.ndim != 3:
             raise ValueError(f"timing_tokens must be [B, N, F], got {tuple(timing_tokens.shape)}")
@@ -544,6 +685,36 @@ class TimingEncoder(nn.Module):
             stacked.append(self.feature_embeddings[idx](tok))
         features = torch.stack(stacked, dim=2) + type_emb
         x = x + features.sum(dim=2)
+        if self.absolute_time_proj is not None:
+            if event_starts_sec is None or event_ends_sec is None or audio_durations_sec is None:
+                raise ValueError(
+                    "absolute-time conditioning requires event starts, event ends, and audio durations"
+                )
+            durations = audio_durations_sec.to(x.dtype).reshape(B, 1).clamp(min=1e-4)
+            starts = torch.nan_to_num(event_starts_sec.to(x.dtype), nan=0.0).clamp(min=0.0)
+            ends = torch.nan_to_num(event_ends_sec.to(x.dtype), nan=0.0)
+            ends = torch.maximum(ends, starts)
+            start_norm = (starts / durations).clamp(0.0, 1.0)
+            end_norm = (ends / durations).clamp(0.0, 1.0)
+            center_norm = 0.5 * (start_norm + end_norm)
+            span_norm = (end_norm - start_norm).clamp(min=0.0)
+            absolute_features = [start_norm, end_norm, center_norm, span_norm]
+            for exponent in range(max(0, self.config.absolute_time_num_frequencies)):
+                angle = math.pi * (2.0 ** exponent)
+                absolute_features.extend(
+                    [
+                        torch.sin(angle * start_norm),
+                        torch.cos(angle * start_norm),
+                        torch.sin(angle * end_norm),
+                        torch.cos(angle * end_norm),
+                    ]
+                )
+            absolute_inputs = torch.stack(absolute_features, dim=-1)
+            absolute_hidden = self.absolute_time_proj(absolute_inputs)
+            absolute_hidden = absolute_hidden * torch.sigmoid(self.absolute_time_gate)
+            if timing_mask is not None:
+                absolute_hidden = absolute_hidden * timing_mask.unsqueeze(-1).to(absolute_hidden.dtype)
+            x = x + absolute_hidden
         if phrase_features is not None:
             if self.phrase_feature_proj is None:
                 raise ValueError("phrase_features were provided but phrase feature support is disabled")
@@ -563,11 +734,13 @@ class TimingEncoder(nn.Module):
         pad_mask = None if timing_mask is None else ~timing_mask
         hidden = self.transformer(x, src_key_padding_mask=pad_mask)
         hidden = self.norm(hidden)
+        self._last_pre_projection_rms = float(hidden.detach().float().square().mean().sqrt().item())
         projected = self.proj(hidden)
 
         if self.stream_type_embedding is not None:
             projected = projected + self.stream_type_embedding.view(1, 1, -1)
         projected = projected * (torch.sigmoid(self.output_gate) * self.config.condition_scale)
+        self._last_output_rms = float(projected.detach().float().square().mean().sqrt().item())
 
         attn_mask = timing_mask.float() if timing_mask is not None else torch.ones(B, N, device=timing_tokens.device)
         global_condition = None
@@ -578,6 +751,8 @@ class TimingEncoder(nn.Module):
                 if global_features.ndim != 2:
                     raise ValueError(f"global_features must be [B, G], got {tuple(global_features.shape)}")
                 global_condition = global_condition + self.global_feature_proj(global_features.to(global_condition.dtype))
+            if self.global_gate is None:
+                raise RuntimeError("global timing modulation is enabled without a global gate")
             global_condition = global_condition * (
                 torch.sigmoid(self.global_gate) * self.config.global_condition_scale
             )
@@ -614,6 +789,9 @@ class TimingEncoder(nn.Module):
         timing_targets: Optional[torch.Tensor] = None,
         phrase_features: Optional[torch.Tensor] = None,
         global_features: Optional[torch.Tensor] = None,
+        event_starts_sec: Optional[torch.Tensor] = None,
+        event_ends_sec: Optional[torch.Tensor] = None,
+        audio_durations_sec: Optional[torch.Tensor] = None,
         dur_weight: float = 1.0,
         onset_weight: float = 0.5,
         pause_weight: float = 0.5,
@@ -626,6 +804,9 @@ class TimingEncoder(nn.Module):
             timing_mask,
             phrase_features=phrase_features,
             global_features=global_features,
+            event_starts_sec=event_starts_sec,
+            event_ends_sec=event_ends_sec,
+            audio_durations_sec=audio_durations_sec,
         )
         if timing_targets is not None:
             t_loss = self.compute_timing_loss(

@@ -112,6 +112,8 @@ def run_fixed(args: argparse.Namespace) -> int:
                 output_dir=train_cfg.output_dir,
                 log_dir=str(train_cfg.effective_log_dir),
             )
+            if stats.failed:
+                return 1
         except KeyboardInterrupt:
             show_info("Training interrupted by user (Ctrl+C)")
             return 130

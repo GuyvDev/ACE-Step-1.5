@@ -11,6 +11,17 @@ import torch
 from acestep.core.generation.handler.lora import lifecycle
 
 
+class AdapterNameTest(unittest.TestCase):
+    def test_decimal_checkpoint_name_is_pytorch_safe(self):
+        self.assertEqual(
+            lifecycle._default_adapter_name_from_path("/tmp/epoch_25_loss_0.8750"),
+            "epoch_25_loss_0_8750",
+        )
+
+    def test_empty_checkpoint_name_uses_default(self):
+        self.assertEqual(lifecycle._default_adapter_name_from_path("/"), "default")
+
+
 class _DummyDecoder:
     """Minimal decoder stub for lifecycle loader tests."""
 

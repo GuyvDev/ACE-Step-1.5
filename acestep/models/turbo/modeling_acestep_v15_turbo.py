@@ -732,7 +732,6 @@ class AceStepLyricEncoder(AceStepPreTrainedModel):
             )
 
             hidden_states = layer_outputs[0]
-
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
@@ -1328,6 +1327,8 @@ class AceStepDiTModel(AceStepPreTrainedModel):
         context_latents: torch.Tensor,
         timing_hidden_states: Optional[torch.Tensor] = None,
         timing_attention_mask: Optional[torch.Tensor] = None,
+        identity_block_adapters: Optional[nn.ModuleDict] = None,
+        identity_singer_embedding: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         past_key_values: Optional[EncoderDecoderCache] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -1515,6 +1516,13 @@ class AceStepDiTModel(AceStepPreTrainedModel):
                 **flash_attn_kwargs,
             )
             hidden_states = layer_outputs[0]
+
+            if identity_block_adapters is not None and identity_singer_embedding is not None:
+                adapter = identity_block_adapters.get(str(index_block)) if hasattr(identity_block_adapters, "get") else None
+                if adapter is None and str(index_block) in identity_block_adapters:
+                    adapter = identity_block_adapters[str(index_block)]
+                if adapter is not None:
+                    hidden_states = adapter(hidden_states, identity_singer_embedding)
 
             if output_attentions and self.layers[index_block].use_cross_attention:
                 # layer_outputs structure: (hidden_states, self_attn_weights, cross_attn_weights)
@@ -1951,6 +1959,29 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
             audio_codes=None,
         )
         
+        identity_voice = kwargs.get("identity_voice_hidden_states")
+        identity_voice_mask = kwargs.get("identity_voice_attention_mask")
+        identity_fragment = kwargs.get("identity_fragment_attention")
+        identity_crop_ids = kwargs.get("identity_voice_crop_ids")
+        identity_blocks = kwargs.get("identity_block_adapters")
+        identity_singer = kwargs.get("identity_singer_embedding")
+        if identity_voice is not None and identity_voice_mask is not None:
+            identity_voice = identity_voice.to(device=encoder_hidden_states.device, dtype=encoder_hidden_states.dtype)
+            identity_voice_mask = identity_voice_mask.to(device=encoder_attention_mask.device)
+            if identity_voice.shape[0] != encoder_hidden_states.shape[0]:
+                identity_voice = identity_voice.expand(encoder_hidden_states.shape[0], -1, -1); identity_voice_mask = identity_voice_mask.expand(encoder_hidden_states.shape[0], -1)
+            if identity_fragment is not None:
+                if identity_crop_ids is None: raise RuntimeError("V5 local inference is missing crop IDs")
+                crop_ids = identity_crop_ids.to(encoder_hidden_states.device).expand(identity_voice.shape[0], -1)
+                encoder_hidden_states = identity_fragment(encoder_hidden_states, identity_voice, crop_ids, identity_voice_mask.bool())
+                if encoder_hidden_states_non_cover is not None: encoder_hidden_states_non_cover = identity_fragment(encoder_hidden_states_non_cover, identity_voice, crop_ids, identity_voice_mask.bool())
+            else:
+                encoder_hidden_states = torch.cat([encoder_hidden_states, identity_voice], dim=1); encoder_attention_mask = torch.cat([encoder_attention_mask, identity_voice_mask.to(encoder_attention_mask.dtype)], dim=1)
+                if encoder_hidden_states_non_cover is not None:
+                    encoder_hidden_states_non_cover = torch.cat([encoder_hidden_states_non_cover, identity_voice], dim=1); encoder_attention_mask_non_cover = torch.cat([encoder_attention_mask_non_cover, identity_voice_mask.to(encoder_attention_mask_non_cover.dtype)], dim=1)
+        if identity_singer is not None:
+            identity_singer = identity_singer.to(device=encoder_hidden_states.device, dtype=encoder_hidden_states.dtype)
+            if identity_singer.shape[0] != encoder_hidden_states.shape[0]: identity_singer = identity_singer.expand(encoder_hidden_states.shape[0], -1)
         end_time = time.time()
         time_costs["encoder_time_cost"] = end_time - start_time
         start_time = end_time
@@ -2010,6 +2041,8 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
                     timing_hidden_states=timing_hidden_states,
                     timing_attention_mask=timing_attention_mask,
                     context_latents=context_latents,
+                    identity_block_adapters=identity_blocks,
+                    identity_singer_embedding=identity_singer,
                     use_cache=True,
                     past_key_values=past_key_values,
                 )
