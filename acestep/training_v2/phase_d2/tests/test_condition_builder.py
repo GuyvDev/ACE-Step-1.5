@@ -99,6 +99,9 @@ def test_build_condition_tensor_shape(config, mock_events):
     
     assert cond_tensor.shape == (1, 250, config.condition_dim)
     assert cond_tensor.dtype == torch.float32
+    duration_start, duration_end = group_slices["explicit_duration"]
+    assert duration_end - duration_start == 4
+    assert torch.any(cond_tensor[:, :, duration_start:duration_end] != 0)
 
 
 def test_condition_tensor_group_slices(config, mock_events):

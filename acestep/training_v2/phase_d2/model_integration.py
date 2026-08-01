@@ -7,12 +7,12 @@ ensuring null-route stability and adapter-only gradient flow.
 
 from __future__ import annotations
 
-from typing import List, Optional, Callable, Dict, Any
+from typing import Callable, Dict, List, Optional
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from acestep.training_v2.phase_d2.config import PhaseD2Config
+from acestep.training_v2.phase_d2.residual_hook import build_temporal_residual_hook
 from acestep.training_v2.phase_d2.temporal_encoder import TemporalConditionEncoder
 from acestep.training_v2.phase_d2.temporal_adapter import ZeroInitTemporalAdapter
 
@@ -51,7 +51,10 @@ class PhaseD2Injector(nn.Module):
         super().__init__()
         
         self.config = config
-        self.layers = transformer_layers
+        # Keep frozen C25 layers as non-owned references. Registering them as a
+        # child module makes injector.parameters() include the entire DiT and
+        # breaks optimizer/checkpoint ownership audits.
+        object.__setattr__(self, "_base_layers", list(transformer_layers))
         
         # Determine injection layer indices
         if config.injection_layer_indices is not None:
@@ -73,14 +76,15 @@ class PhaseD2Injector(nn.Module):
         # Create condition encoder
         self.encoder = TemporalConditionEncoder(
             condition_dim=config.condition_dim,
-            hidden_size=config.hidden_size,
+            hidden_size=config.condition_hidden_size,
         )
         
         # Create adapters for each injection point
         self.adapters = nn.ModuleList([
             ZeroInitTemporalAdapter(
-                condition_dim=config.hidden_size,
+                condition_dim=config.condition_hidden_size,
                 hidden_size=config.hidden_size,
+                adapter_dim=config.adapter_bottleneck_size,
             )
             for _ in injection_indices
         ])
@@ -141,95 +145,10 @@ class PhaseD2Injector(nn.Module):
             raise RuntimeError("PhaseD2Injector is already attached; detach before re-attaching.")
 
         for layer_idx, adapter_idx in enumerate(self.injection_indices):
-            layer = self.layers[adapter_idx]
+            layer = self._base_layers[adapter_idx]
             adapter = self.adapters[layer_idx]
             
-            def make_hook(adp: ZeroInitTemporalAdapter) -> Callable:
-                """Closure to bind adapter."""
-                def hook(
-                    module: nn.Module,
-                    input: tuple,
-                    output: torch.Tensor | tuple,
-                ) -> torch.Tensor | tuple:
-                    """Add adapter residual to layer output."""
-                    if self._current_condition is None:
-                        # Null route: return output unchanged (fail-closed)
-                        return output
-
-                    if isinstance(output, torch.Tensor):
-                        hidden_states = output
-                        rebuild = lambda value: value
-                    elif (
-                        isinstance(output, tuple)
-                        and output
-                        and isinstance(output[0], torch.Tensor)
-                    ):
-                        hidden_states = output[0]
-                        rebuild = lambda value: (value, *output[1:])
-                    else:
-                        raise TypeError(
-                            "Phase D2 injection requires a Tensor or tuple whose "
-                            f"first element is a Tensor; got {type(output)!r}."
-                        )
-                    if hidden_states.dim() != 3:
-                        raise ValueError(
-                            "ACE/D2 hidden states must be [B,T,H], got "
-                            f"{tuple(hidden_states.shape)}."
-                        )
-                    if hidden_states.shape[-1] != self.config.hidden_size:
-                        raise ValueError(
-                            f"Hidden size {hidden_states.shape[-1]} does not match "
-                            f"D2 config.hidden_size {self.config.hidden_size}."
-                        )
-
-                    condition = self._current_condition.to(
-                        device=hidden_states.device, dtype=hidden_states.dtype
-                    )
-                    if condition.shape[0] == 1 and hidden_states.shape[0] > 1:
-                        condition = condition.expand(hidden_states.shape[0], -1, -1)
-                    if condition.shape[0] != hidden_states.shape[0]:
-                        raise ValueError(
-                            f"Condition batch {condition.shape[0]} does not match "
-                            f"hidden batch {hidden_states.shape[0]}."
-                        )
-                    # Encode condition
-                    cond_latent = self.encoder(condition)
-                    if cond_latent.shape[1] != hidden_states.shape[1]:
-                        cond_latent = F.interpolate(
-                            cond_latent.transpose(1, 2),
-                            size=hidden_states.shape[1],
-                            mode="linear",
-                            align_corners=False,
-                        ).transpose(1, 2)
-                    
-                    # Apply adapter
-                    residual = adp(
-                        hidden_states=hidden_states,
-                        condition=cond_latent,
-                        control_strength=self._current_control_strength,
-                    )
-                    
-                    # Mask residual if vocal_mask provided (optional)
-                    if self._current_vocal_mask is not None:
-                        mask = self._current_vocal_mask.to(hidden_states.device)
-                        if mask.shape[0] == 1 and hidden_states.shape[0] > 1:
-                            mask = mask.expand(hidden_states.shape[0], -1)
-                        if mask.shape[0] != hidden_states.shape[0]:
-                            raise ValueError("Vocal mask batch does not match hidden batch.")
-                        if mask.shape[1] != hidden_states.shape[1]:
-                            mask = F.interpolate(
-                                mask.float().unsqueeze(1),
-                                size=hidden_states.shape[1],
-                                mode="nearest",
-                            ).squeeze(1)
-                        mask = mask.unsqueeze(-1)  # [B, T, 1]
-                        residual = residual * mask.float()
-
-                    return rebuild(hidden_states + residual)
-                
-                return hook
-            
-            hook_fn = make_hook(adapter)
+            hook_fn = build_temporal_residual_hook(self, adapter)
             hook_handle = layer.register_forward_hook(hook_fn)
             self._hooks[adapter_idx] = hook_handle
     

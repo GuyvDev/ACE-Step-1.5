@@ -361,6 +361,19 @@ def build_condition_tensor(
             section_id, phrase_id, word_id, pause
         ], dim=1)
         idx += 4
+
+    if config.explicit_duration:
+        phrase_duration = torch.from_numpy(sidecar["target_phrase_duration"].astype(np.float32))
+        word_duration = torch.from_numpy(sidecar["target_word_duration"].astype(np.float32))
+        phoneme_duration = torch.from_numpy(sidecar["target_phoneme_duration"].astype(np.float32))
+        phoneme_word_ratio = phoneme_duration / word_duration.clamp_min(1e-6)
+        cond[0, :, idx:idx+4] = torch.stack([
+            torch.clamp(phrase_duration / 15.0, 0, 1),
+            torch.clamp(word_duration / 5.0, 0, 1),
+            torch.clamp(phoneme_duration / 2.0, 0, 1),
+            torch.clamp(phoneme_word_ratio, 0, 2) - 1.0,
+        ], dim=1)
+        idx += 4
     
     audit = {
         "frame_rate": config.latent_frame_rate_hz,
@@ -373,6 +386,7 @@ def build_condition_tensor(
             config.breath_energy,
             config.vocal_activity,
             config.structure,
+            config.explicit_duration,
         ]),
         "normalization_method": "clamp to [-1, 1]",
         "sidecar_metadata": sidecar.get("metadata", {}),

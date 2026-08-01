@@ -17,9 +17,11 @@ Schema: phase_d2_sidecar_v1 (see sidecar_schema.py)
 from __future__ import annotations
 
 from acestep.training_v2.phase_d2.config import PhaseD2Config
+from acestep.training_v2.phase_d2.regulated_condition import build_regulated_condition
 from acestep.training_v2.phase_d2.sidecar_schema import validate_sidecar
 
 __all__ = [
     "PhaseD2Config",
+    "build_regulated_condition",
     "validate_sidecar",
 ]

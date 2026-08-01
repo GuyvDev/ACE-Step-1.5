@@ -21,7 +21,9 @@ class PhaseD2Config:
     
     Attributes:
         latent_frame_rate_hz: Frame rate of base model latent sequence (default 25.0 Hz).
-        hidden_size: Adapter hidden dimension (default 256).
+        hidden_size: Frozen DiT hidden dimension.
+        condition_hidden_size: Width of the lightweight temporal encoder.
+        adapter_bottleneck_size: Per-layer residual adapter bottleneck width.
         num_adapter_layers: Number of transformer layers to inject adapters (default 6).
         injection_layer_indices: Explicit layer indices for adapter injection, if provided.
             If None, defaults to first num_adapter_layers layers.
@@ -39,11 +41,14 @@ class PhaseD2Config:
             breath_energy: Breath and energy markers.
             vocal_activity: Voice activity and pause indicators.
             structure: Section/phrase/word boundary IDs.
+            explicit_duration: Phrase, word, phoneme, and phoneme/note duration ratio.
     """
     
     # Frame rate and dimensions
     latent_frame_rate_hz: float = 25.0
     hidden_size: int = 256
+    condition_hidden_size: int = 256
+    adapter_bottleneck_size: int = 128
     num_adapter_layers: int = 6
     injection_layer_indices: List[int] | None = None
     
@@ -61,6 +66,7 @@ class PhaseD2Config:
     breath_energy: bool = True
     vocal_activity: bool = True
     structure: bool = True
+    explicit_duration: bool = True
     
     def __post_init__(self) -> None:
         """Validate and compute derived fields."""
@@ -76,6 +82,8 @@ class PhaseD2Config:
             )
         if self.latent_frame_rate_hz <= 0:
             raise ValueError(f"latent_frame_rate_hz must be > 0, got {self.latent_frame_rate_hz}.")
+        if min(self.hidden_size, self.condition_hidden_size, self.adapter_bottleneck_size) <= 0:
+            raise ValueError("D2 model, condition, and adapter widths must all be positive.")
         
         self.compute_condition_dim()
     
@@ -90,6 +98,7 @@ class PhaseD2Config:
             breath_energy: 2 (energy, breath)
             vocal_activity: 2 (voiced, vocal_active)
             structure: 4 (section_id, phrase_id, word_id, pause)
+            explicit_duration: 4 (phrase, word, phoneme, phoneme/note ratio)
         """
         dim = 0
         if self.linguistic:
@@ -105,6 +114,8 @@ class PhaseD2Config:
         if self.vocal_activity:
             dim += 2
         if self.structure:
+            dim += 4
+        if self.explicit_duration:
             dim += 4
         
         self.condition_dim = dim
@@ -140,6 +151,9 @@ class PhaseD2Config:
             idx += 2
         if self.structure:
             slices["structure"] = (idx, idx + 4)
+            idx += 4
+        if self.explicit_duration:
+            slices["explicit_duration"] = (idx, idx + 4)
             idx += 4
         
         return slices
