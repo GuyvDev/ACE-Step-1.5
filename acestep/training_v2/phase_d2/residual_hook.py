@@ -50,6 +50,8 @@ def build_temporal_residual_hook(injector: Any, adapter: Any) -> Callable:
             dtype=hidden_states.dtype,
         )
         condition = _match_batch(condition, hidden_states.shape[0], "Condition")
+        if not bool(condition.ne(0).any()):
+            return output
         condition = injector.encoder(condition)
         if condition.shape[1] != hidden_states.shape[1]:
             condition = F.interpolate(

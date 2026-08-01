@@ -1,9 +1,25 @@
-"""Tests for explicit duration-based Phase D2 frame regulation."""
+"""Tests for physical duration-based Phase D2 frame regulation."""
 
 import pytest
 import torch
 
-from acestep.training_v2.phase_d2.length_regulator import length_regulate
+from acestep.training_v2.phase_d2.length_regulator import (
+    allocate_duration_frames,
+    length_regulate,
+)
+
+
+def test_one_second_uses_real_latent_frame_rate():
+    """One physical second maps to the configured latent frame rate."""
+    assert allocate_duration_frames(torch.tensor([1.0]), 25.0).tolist() == [25]
+
+
+def test_fractional_durations_allocate_remainder_deterministically():
+    """Fractional physical frames use stable largest-remainder allocation."""
+    first = allocate_duration_frames(torch.tensor([0.1, 0.1, 0.1]), 25.0)
+    second = allocate_duration_frames(torch.tensor([0.1, 0.1, 0.1]), 25.0)
+    assert first.tolist() == [3, 3, 2]
+    assert torch.equal(first, second)
 
 
 def test_length_regulator_exact_target_and_order():
@@ -16,6 +32,10 @@ def test_length_regulator_exact_target_and_order():
     assert event_ids.tolist() == sorted(event_ids.tolist())
     assert sum(audit["event_frame_counts"]) == 20
     assert audit["event_order_preserved"]
+    assert audit["physical_total_frames_rounded"] == 20
+    assert audit["target_frames_role"] == "final_global_resampling_target"
+    assert audit["global_resampling_factor"] == pytest.approx(1.0)
+    assert audit["collisions"] == 0
 
 
 def test_length_regulator_duration_stretch_adds_only_target_event_frames():
@@ -23,11 +43,20 @@ def test_length_regulator_duration_stretch_adds_only_target_event_frames():
     features = torch.eye(3)
     base = length_regulate(features, torch.tensor([0.2, 0.2, 0.2]), 25.0)[2]
     stretched = length_regulate(features, torch.tensor([0.2, 0.4, 0.2]), 25.0)[2]
-    base_counts = base["event_frame_counts"]
-    stretch_counts = stretched["event_frame_counts"]
-    assert stretch_counts[0] == base_counts[0]
-    assert stretch_counts[2] == base_counts[2]
-    assert stretch_counts[1] > base_counts[1]
+    assert stretched["event_frame_counts"][0] == base["event_frame_counts"][0]
+    assert stretched["event_frame_counts"][2] == base["event_frame_counts"][2]
+    assert stretched["event_frame_counts"][1] > base["event_frame_counts"][1]
+
+
+def test_fixed_and_expanded_total_budgets_are_audited():
+    """Global fixed and expanded budgets retain the physical conversion record."""
+    features = torch.eye(2)
+    fixed = length_regulate(features, torch.tensor([0.4, 0.6]), 25.0, 25)[2]
+    expanded = length_regulate(features, torch.tensor([0.4, 0.6]), 25.0, 30)[2]
+    assert fixed["physical_frame_quotas"] == pytest.approx([10.0, 15.0])
+    assert fixed["event_frame_counts"] == [10, 15]
+    assert expanded["event_frame_counts"] == [12, 18]
+    assert expanded["global_resampling_factor"] == pytest.approx(1.2)
 
 
 def test_length_regulator_rejects_impossible_budget():

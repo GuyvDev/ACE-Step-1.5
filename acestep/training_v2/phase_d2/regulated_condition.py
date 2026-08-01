@@ -1,4 +1,4 @@
-"""Duration-regulated event conditions for the established D2 control path."""
+"""Duration-regulated, example-specific conditions for the D2 control path."""
 
 from __future__ import annotations
 
@@ -10,8 +10,13 @@ from acestep.training_v2.phase_d2.config import PhaseD2Config
 from acestep.training_v2.phase_d2.length_regulator import length_regulate
 
 
-def _event_feature(event: dict[str, Any], config: PhaseD2Config) -> list[float]:
-    """Map one phoneme/note or silence event into the configured schema."""
+def _event_feature(
+    event: dict[str, Any],
+    config: PhaseD2Config,
+    event_start_sec: float,
+    total_duration_sec: float,
+) -> list[float]:
+    """Map one ordered sidecar event and its real onset into the D2 schema."""
     silence = bool(event.get("silence", False))
     duration = float(event["duration_sec"])
     note_duration = max(float(event.get("note_duration_sec", duration)), 1e-6)
@@ -26,7 +31,12 @@ def _event_feature(event: dict[str, Any], config: PhaseD2Config) -> list[float]:
             float(event.get("pos_in_phrase", 0.0)),
         ])
     if config.absolute_timing:
-        values.extend([0.0, 0.0])
+        phrase_start = float(event.get("phrase_start_sec", 0.0))
+        phrase_relative_start = (event_start_sec - phrase_start) / phrase_duration
+        values.extend([
+            max(-1.0, min(1.0, 2.0 * event_start_sec / total_duration_sec - 1.0)),
+            max(-1.0, min(1.0, phrase_relative_start)),
+        ])
     if config.beat_relative_timing:
         values.extend([
             max(-1.0, min(1.0, float(event.get("beat_offset_sec", 0.0)) / 0.5)),
@@ -37,7 +47,9 @@ def _event_feature(event: dict[str, Any], config: PhaseD2Config) -> list[float]:
         values.extend([
             max(0.0, min(1.0, float(event.get("f0_hz", 0.0)) / 300.0)),
             max(-1.0, min(1.0, float(event.get("midi_note", 0.0)) / 60.0 - 1.0)),
-            0.0, 0.0, float(event.get("vowel", False)),
+            0.0,
+            0.0,
+            float(event.get("vowel", False)),
         ])
     if config.breath_energy:
         values.extend([
@@ -48,8 +60,8 @@ def _event_feature(event: dict[str, Any], config: PhaseD2Config) -> list[float]:
         values.extend([float(not silence and event.get("voiced", True)), float(not silence)])
     if config.structure:
         values.extend([
-            0.0,
-            0.0 if not silence else -0.005,
+            float(event.get("section_id", 0)) / 50.0,
+            float(event.get("phrase_id", 0)) / 200.0 if not silence else -0.005,
             float(event.get("word_id", -1)) / 100.0,
             float(silence),
         ])
@@ -68,11 +80,18 @@ def build_regulated_condition(
     target_frames: int,
     config: PhaseD2Config,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-    """Expand ordered positive-duration events to exactly ``target_frames``."""
+    """Expand ordered events to a global frame budget with real timing channels."""
     if not events:
         raise ValueError("regulated condition requires at least one event")
     durations = torch.tensor([float(event["duration_sec"]) for event in events])
-    features = torch.tensor([_event_feature(event, config) for event in events])
+    if not bool(torch.isfinite(durations).all()) or bool((durations <= 0).any()):
+        raise ValueError("event durations must be finite and positive")
+    total_duration = float(durations.sum())
+    event_starts = torch.cat([torch.zeros(1), durations.cumsum(0)[:-1]])
+    features = torch.tensor([
+        _event_feature(event, config, float(start), total_duration)
+        for event, start in zip(events, event_starts)
+    ])
     if features.shape[1] != config.condition_dim:
         raise RuntimeError("regulated feature width differs from D2 config")
     dense, event_ids, audit = length_regulate(
@@ -81,11 +100,6 @@ def build_regulated_condition(
         config.latent_frame_rate_hz,
         target_frames,
     )
-    frame_time = torch.arange(target_frames, dtype=dense.dtype) / max(target_frames - 1, 1)
-    if config.absolute_timing:
-        start, _ = config.get_condition_group_slices()["absolute_timing"]
-        dense[:, start] = 2.0 * frame_time - 1.0
-        dense[:, start + 1] = frame_time
     if config.melody_prosody:
         start, _ = config.get_condition_group_slices()["melody_prosody"]
         boundaries = torch.cat([torch.tensor([True]), event_ids[1:] != event_ids[:-1]])
@@ -93,10 +107,12 @@ def build_regulated_condition(
         dense[boundaries, start + 2] = 1.0
         dense[ends, start + 3] = 1.0
     audit.update({
-        "schema": "phase_d2_regulated_condition_v1",
+        "schema": "phase_d2_regulated_condition_v2",
         "condition_dim": config.condition_dim,
         "event_count": len(events),
-        "duration_sum_sec": float(durations.sum()),
+        "duration_sum_sec": total_duration,
+        "event_start_seconds": event_starts.tolist(),
+        "absolute_timing_source": "sidecar_event_start_seconds_and_phrase_relative_start",
         "overlap_frame_count": 0,
     })
     return dense.unsqueeze(0), event_ids, audit

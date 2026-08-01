@@ -73,3 +73,36 @@ def test_regulated_condition_rejects_empty_or_nonpositive_events():
     invalid[0]["duration_sec"] = 0.0
     with pytest.raises(ValueError, match="finite and positive"):
         build_regulated_condition(invalid, 10, config)
+
+
+def _shifted_events(shift_sec: float) -> list[dict[str, float | bool]]:
+    """Build one event on a fixed two-second canvas with adjustable onset."""
+    start = 0.75 + shift_sec
+    return [
+        {"duration_sec": start, "silence": True},
+        {
+            "duration_sec": 0.5,
+            "phrase_duration_sec": 0.5,
+            "phrase_start_sec": start,
+            "word_id": 1,
+            "phoneme_id": 1,
+        },
+        {"duration_sec": 2.0 - start - 0.5, "silence": True},
+    ]
+
+
+def test_absolute_timing_relocates_for_counterfactual_phrase_shifts():
+    """Original, -0.5 s, and +0.5 s controls occupy distinct timing frames."""
+    config = PhaseD2Config(latent_frame_rate_hz=20.0)
+    timing_start, timing_end = config.get_condition_group_slices()["absolute_timing"]
+    locations = []
+    timing_values = []
+    for shift in (0.0, -0.5, 0.5):
+        dense, event_ids, audit = build_regulated_condition(_shifted_events(shift), 40, config)
+        event_frames = torch.where(event_ids == 1)[0]
+        locations.append((int(event_frames[0]), int(event_frames[-1])))
+        timing_values.append(dense[0, event_frames[0], timing_start:timing_end])
+        assert audit["absolute_timing_source"].startswith("sidecar_event_start_seconds")
+    assert locations == [(15, 24), (5, 14), (25, 34)]
+    assert not torch.equal(timing_values[0], timing_values[1])
+    assert not torch.equal(timing_values[0], timing_values[2])

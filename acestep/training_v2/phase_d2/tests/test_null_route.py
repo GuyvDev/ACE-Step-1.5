@@ -101,8 +101,7 @@ def test_condition_changes_output(dummy_transformer_stack, config):
     # Make one trained-like residual nonzero; a fresh zero-init adapter is
     # expected to be identical even with a condition.
     with torch.no_grad():
-        injector.adapters[0].up.weight.normal_(std=0.01)
-        injector.adapters[0].gate.fill_(1.0)
+        injector.adapters[0].output_projection.weight.normal_(std=0.01)
     injector.attach()
 
     x = torch.randn(2, 50, 256)
@@ -134,7 +133,7 @@ def test_real_dit_tuple_and_patch_length_contract():
     layers = nn.ModuleList([TupleLayer(hidden_size)])
     injector = PhaseD2Injector(layers, config)
     with torch.no_grad():
-        injector.adapters[0].up.weight.normal_(std=0.01)
+        injector.adapters[0].output_projection.weight.normal_(std=0.01)
     injector.attach()
     injector.set_condition(torch.randn(1, 20, config.condition_dim))
     output = layers[0](torch.randn(2, 10, hidden_size))
@@ -159,4 +158,28 @@ def test_tuple_null_route_is_bit_identical():
         hooked = layers[0](value)
     assert torch.equal(unhooked[0], hooked[0])
     assert unhooked[1] == hooked[1]
+    injector.detach()
+
+
+def test_explicit_zero_condition_is_bit_identical_after_training_like_change(
+    dummy_transformer_stack, config
+):
+    """An attached explicit-zero control follows the exact base trajectory."""
+    for layer in dummy_transformer_stack:
+        layer.eval()
+    value = torch.randn(2, 50, 256)
+    with torch.no_grad():
+        baseline = value.clone()
+        for layer in dummy_transformer_stack:
+            baseline = layer(baseline)
+    injector = PhaseD2Injector(dummy_transformer_stack, config)
+    with torch.no_grad():
+        injector.adapters[0].output_projection.weight.normal_(std=0.01)
+    injector.attach()
+    injector.set_condition(torch.zeros(2, 50, config.condition_dim))
+    with torch.no_grad():
+        controlled = value.clone()
+        for layer in dummy_transformer_stack:
+            controlled = layer(controlled)
+    assert torch.equal(baseline, controlled)
     injector.detach()

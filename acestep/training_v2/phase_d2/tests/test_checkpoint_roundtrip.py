@@ -41,8 +41,8 @@ def test_save_load_roundtrip(dummy_transformer_stack, config, tmp_path):
     # Perturb adapter weights slightly to verify they're saved
     for adapter in injector1.adapters:
         with torch.no_grad():
-            adapter.down.weight.add_(0.01)
-            adapter.gate.add_(0.001)
+            adapter.condition_projection.weight.add_(0.01)
+            adapter.output_projection.weight.add_(0.001)
     
     # Save
     checkpoint_path = tmp_path / "adapters.pt"
