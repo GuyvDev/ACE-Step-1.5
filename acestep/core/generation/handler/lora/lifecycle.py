@@ -163,7 +163,8 @@ def _default_adapter_name_from_path(lora_path: str) -> str:
     return name or "default"
 
 
-def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
+def add_lora(self, lora_path: str, adapter_name: str | None = None,
+             exclude_modules: list[str] | None = None) -> str:
     """Load a LoRA adapter into the decoder under the given name.
 
     If the decoder is not yet a PeftModel, wraps it and loads the first adapter.
@@ -196,10 +197,11 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
             )
 
     try:
-        from peft import PeftModel
+        from peft import PeftConfig, PeftModel
     except ImportError:
         if lokr_weights_path is None:
             return "❌ PEFT library not installed. Please install with: pip install peft"
+        PeftConfig = None  # type: ignore[assignment]
         PeftModel = None  # type: ignore[assignment]
 
     effective_name = adapter_name.strip() if isinstance(adapter_name, str) and adapter_name.strip() else _default_adapter_name_from_path(lora_path)
@@ -213,6 +215,19 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
     try:
         decoder = self.model.decoder
         is_peft = PeftModel is not None and isinstance(decoder, PeftModel)
+        peft_config = None
+        if exclude_modules:
+            normalized_exclusions = sorted(set(exclude_modules))
+            if (len(normalized_exclusions) != len(exclude_modules)
+                    or any(not isinstance(value, str) or not value.strip()
+                           for value in normalized_exclusions)):
+                return "❌ Invalid PEFT exclude_modules request."
+            if lokr_weights_path is not None:
+                return "❌ PEFT exclude_modules cannot be used with LoKr."
+            if is_peft:
+                return "❌ PEFT exclude_modules is supported only for the first adapter."
+            peft_config = PeftConfig.from_pretrained(lora_path)
+            peft_config.exclude_modules = normalized_exclusions
 
         if not is_peft:
             # First LoRA: backup base once, then wrap with PEFT
@@ -239,7 +254,8 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
             else:
                 logger.info(f"Loading LoRA adapter from {lora_path} as '{effective_name}'")
                 self.model.decoder = PeftModel.from_pretrained(
-                    decoder, lora_path, adapter_name=effective_name, is_trainable=False
+                    decoder, lora_path, adapter_name=effective_name, is_trainable=False,
+                    config=peft_config,
                 )
                 self._adapter_type = "lora"
         else:
@@ -288,10 +304,11 @@ def add_lora(self, lora_path: str, adapter_name: str | None = None) -> str:
         return f"❌ Failed to load LoRA: {str(e)}"
 
 
-def load_lora(self, lora_path: str) -> str:
+def load_lora(self, lora_path: str, exclude_modules: list[str] | None = None) -> str:
     """Load a single adapter (backward-compat), including LyCORIS LoKr paths."""
     lokr_weights_path = _resolve_lokr_weights_path(lora_path.strip()) if isinstance(lora_path, str) else None
-    message = self.add_lora(lora_path, adapter_name=None)
+    kwargs = {"exclude_modules": exclude_modules} if exclude_modules else {}
+    message = self.add_lora(lora_path, adapter_name=None, **kwargs)
     if lokr_weights_path is not None and message.startswith("✅"):
         return f"✅ LoKr loaded from {lokr_weights_path}"
     return message

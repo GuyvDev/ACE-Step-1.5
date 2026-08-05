@@ -79,9 +79,12 @@ class _DummyHandler:
         """Return simple debug payload."""
         return {}
 
-    def add_lora(self, lora_path, adapter_name=None):
+    def add_lora(self, lora_path, adapter_name=None, exclude_modules=None):
         """Forward to lifecycle implementation to mimic mixin wiring."""
-        return lifecycle.add_lora(self, lora_path, adapter_name=adapter_name)
+        return lifecycle.add_lora(
+            self, lora_path, adapter_name=adapter_name,
+            exclude_modules=exclude_modules,
+        )
 
 
 class LifecycleTests(unittest.TestCase):
@@ -186,6 +189,50 @@ class LifecycleTests(unittest.TestCase):
         base_net.apply_to.assert_called_once_with()
         base_net.load_weights.assert_called_once_with("weights.safetensors")
         self.assertIs(decoder._lycoris_net, base_net)
+
+    def test_exact_load_excludes_requested_modules_in_memory(self):
+        """Strict callers can exclude new architecture modules without editing artifacts."""
+        handler = _DummyHandler()
+        captured = {}
+
+        class FakePeftConfig:
+            @classmethod
+            def from_pretrained(cls, path):
+                captured["config_path"] = path
+                return SimpleNamespace(exclude_modules=None)
+
+        class FakePeftModel(_DummyDecoder):
+            @classmethod
+            def from_pretrained(cls, decoder, path, **kwargs):
+                captured["decoder"] = decoder
+                captured["path"] = path
+                captured["kwargs"] = kwargs
+                return cls()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter_dir = Path(tmp) / "adapter"
+            adapter_dir.mkdir()
+            (adapter_dir / "adapter_config.json").write_text("{}")
+            fake_peft = SimpleNamespace(
+                PeftConfig=FakePeftConfig, PeftModel=FakePeftModel)
+            with patch.dict("sys.modules", {"peft": fake_peft}):
+                message = lifecycle.load_lora(
+                    handler, str(adapter_dir),
+                    exclude_modules=["timing_cross_attn.q_proj",
+                                     "timing_cross_attn.k_proj",
+                                     "timing_cross_attn.v_proj",
+                                     "timing_cross_attn.o_proj"],
+                )
+
+        self.assertTrue(message.startswith("✅"), message)
+        config = captured["kwargs"]["config"]
+        self.assertEqual(
+            config.exclude_modules,
+            ["timing_cross_attn.k_proj", "timing_cross_attn.o_proj",
+             "timing_cross_attn.q_proj", "timing_cross_attn.v_proj"],
+        )
+        self.assertEqual(captured["config_path"], str(adapter_dir))
+        self.assertFalse(captured["kwargs"]["is_trainable"])
 
     def test_unload_lora_restores_lokr_adapter_before_state_restore(self):
         """Unload should call LyCORIS restore() and then restore decoder weights."""
