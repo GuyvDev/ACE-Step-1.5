@@ -1772,6 +1772,18 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
         hidden_states = self.detokenizer(quantized)
         return hidden_states
 
+    def apply_performance_regulator(self, context_latents: torch.Tensor) -> torch.Tensor:
+        """Apply an explicitly attached frame regulator outside condition no-grad.
+
+        The optional module owns its active plan and must return the original tensor
+        object when no plan is active. Keeping this call outside ``prepare_condition``
+        preserves gradients without broadening the condition encoder's grad boundary.
+        """
+        regulator = getattr(self, "performance_regulator", None)
+        if regulator is None:
+            return context_latents
+        return regulator.apply_to_context(context_latents)
+
     @torch.no_grad()
     def prepare_condition(
         self,
@@ -1859,6 +1871,7 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
             chunk_masks=chunk_masks,
             is_covers=is_covers,
         )
+        context_latents = self.apply_performance_regulator(context_latents)
         bsz, device, dtype = hidden_states.shape[0], hidden_states.device, hidden_states.dtype
         # Classifier-free guidance: randomly drop conditions with probability cfg_ratio
         # This helps the model learn to work with and without conditions
@@ -2002,6 +2015,7 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
             precomputed_lm_hints_25Hz=precomputed_lm_hints_25Hz,
             audio_codes=audio_codes,
         )
+        context_latents = self.apply_performance_regulator(context_latents)
         encoder_hidden_states_non_cover, encoder_attention_mask_non_cover, context_latents_non_cover = None, None, None
         if audio_cover_strength < 1.0:
             non_is_covers = torch.zeros_like(is_covers, device=is_covers.device, dtype=is_covers.dtype)
@@ -2023,6 +2037,9 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
             precomputed_lm_hints_25Hz=None,
             audio_codes=None,
         )
+            context_latents_non_cover = self.apply_performance_regulator(
+                context_latents_non_cover
+            )
         identity_voice = kwargs.get("identity_voice_hidden_states")
         identity_voice_mask = kwargs.get("identity_voice_attention_mask")
         identity_fragment = kwargs.get("identity_fragment_attention")
