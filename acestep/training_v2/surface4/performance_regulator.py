@@ -81,6 +81,7 @@ class PerformanceRegulator(nn.Module):
 
 
     
+    @property
     def inference_residual_scale(self) -> float:
         """Return the non-trainable inference-only residual multiplier."""
         return self._inference_residual_scale
