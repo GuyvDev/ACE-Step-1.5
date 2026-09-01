@@ -35,6 +35,7 @@ class PerformanceRegulator(nn.Module):
         self.output_projection = nn.Linear(hidden_size, context_dim, bias=False)
         nn.init.zeros_(self.output_projection.weight)
         self._active_plan: dict[str, torch.Tensor] | None = None
+        self._inference_residual_scale = 1.0
 
     @property
     def trainable_parameter_count(self) -> int:
@@ -78,6 +79,19 @@ class PerformanceRegulator(nn.Module):
         """Disable the regulator without changing the context tensor."""
         self._active_plan = None
 
+
+    
+    def inference_residual_scale(self) -> float:
+        """Return the non-trainable inference-only residual multiplier."""
+        return self._inference_residual_scale
+
+    def set_inference_residual_scale(self, scale: float) -> None:
+        """Set a finite inference-only multiplier without adding model state."""
+        value = float(scale)
+        if not torch.isfinite(torch.tensor(value)) or not 0.0 <= value <= 1.0:
+            raise ValueError("Surface 4 residual scale must be finite within [0, 1]")
+        self._inference_residual_scale = value
+
     def forward(
         self,
         phone_ids: torch.Tensor,
@@ -97,7 +111,7 @@ class PerformanceRegulator(nn.Module):
 
     def apply_to_context(self, context_latents: torch.Tensor) -> torch.Tensor:
         """Add the active residual to only the existing first 64 context channels."""
-        if self._active_plan is None:
+        if self._active_plan is None or self._inference_residual_scale == 0.0:
             return context_latents
         plan = self._active_plan
         if plan["phone_ids"].shape[1] != context_latents.shape[1]:
@@ -122,6 +136,8 @@ class PerformanceRegulator(nn.Module):
             device=context_latents.device,
             dtype=context_latents.dtype,
         ).unsqueeze(-1)
+        if self._inference_residual_scale != 1.0:
+            residual = residual * self._inference_residual_scale
         if residual.shape[-1] != 64 or context_latents.shape[-1] < 64:
             raise RuntimeError("Surface 4 requires exactly 64 acoustic-context channels")
         regulated = context_latents[..., :64] + residual
